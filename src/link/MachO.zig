@@ -2344,16 +2344,9 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
 
     log.debug("resolving symbols in '{s}'", .{object.name});
 
-    for (object.symtab.items) |sym, id| {
+    for (object.globals.items) |sym, id| {
         const sym_id = @intCast(u32, id);
         const sym_name = object.getString(sym.n_strx);
-
-        if (symbolIsStab(sym)) {
-            log.err("unhandled symbol type: stab", .{});
-            log.err("  symbol '{s}'", .{sym_name});
-            log.err("  first definition in '{s}'", .{object.name});
-            return error.UnhandledSymbolType;
-        }
 
         if (symbolIsIndr(sym)) {
             log.err("unhandled symbol type: indirect", .{});
@@ -2369,11 +2362,37 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
             return error.UnhandledSymbolType;
         }
 
-        if (symbolIsSect(sym)) {
-            if (!symbolIsExt(sym)) continue; // Symbol local to object, so skip it.
+        const n_strx = try self.makeString(sym_name);
+        const global = self.globs.getPtr(n_strx) orelse {
+            const ref = try self.base.allocator.create(Glob.Ref);
+            errdefer self.base.allocator.destroy(ref);
+            try self.managed_refs.append(self.base.allocator, ref);
+            ref.* = .{
+                .sym_index = sym_id,
+                .file = object_id,
+                .next = null,
+                .prev = null,
+            };
+            try self.globs.putNoClobber(self.base.allocator, n_strx, .{
+                .nlist = .{
+                    .n_strx = n_strx,
+                    .n_type = sym.n_type,
+                    .n_sect = sym.n_sect,
+                    .n_desc = sym.n_desc,
+                    .n_value = sym.n_value,
+                },
+                .ref = ref,
+            });
+            continue;
+        };
 
-            const n_strx = try self.makeString(sym_name);
-            const global = self.globs.getPtr(n_strx) orelse {
+        if (symbolIsSect(global.nlist)) {
+            // Global resolved is defined, so:
+            // 1. skip it if current is weak
+            // 2. flag collision if both are strong
+            // 3. fall-through otherwise (and update in shared code)
+            if (symbolIsWeakDef(sym) or symbolIsPext(sym)) {
+                // Current symbol is weak, so lower priority.
                 const ref = try self.base.allocator.create(Glob.Ref);
                 errdefer self.base.allocator.destroy(ref);
                 try self.managed_refs.append(self.base.allocator, ref);
@@ -2381,72 +2400,49 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                     .sym_index = sym_id,
                     .file = object_id,
                     .next = null,
-                    .prev = null,
+                    .prev = global.ref,
                 };
-                try self.globs.putNoClobber(self.base.allocator, n_strx, .{
-                    .nlist = .{
-                        .n_strx = n_strx,
-                        .n_type = sym.n_type,
-                        .n_sect = sym.n_sect,
-                        .n_desc = sym.n_desc,
-                        .n_value = sym.n_value,
-                    },
-                    .ref = ref,
-                });
+                global.ref.next = ref;
                 continue;
-            };
-
-            if (symbolIsSect(global.nlist)) {
-                // Global resolved is defined, so:
-                // 1. skip it if current is weak
-                // 2. flag collision if both are strong
-                // 3. fall-through otherwise (and update in shared code)
-                if (symbolIsWeakDef(sym) or symbolIsPext(sym)) {
-                    // Current symbol is weak, so lower priority.
-                    const ref = try self.base.allocator.create(Glob.Ref);
-                    errdefer self.base.allocator.destroy(ref);
-                    try self.managed_refs.append(self.base.allocator, ref);
-                    ref.* = .{
-                        .sym_index = sym_id,
-                        .file = object_id,
-                        .next = null,
-                        .prev = global.ref,
-                    };
-                    global.ref.next = ref;
-                    continue;
-                }
-                if (!symbolIsWeakDef(sym) and !symbolIsPext(sym)) {
-                    log.err("symbol '{s}' defined multiple times", .{sym_name});
-                    if (global.ref.file) |file| {
-                        log.err("  first definition in '{s}'", .{self.objects.items[file].name});
-                    }
-                    log.err("  next definition in '{s}'", .{object.name});
-                    return error.MultipleSymbolDefinitions;
-                }
-            } else {
-                _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.globs.getIndex(n_strx).?));
             }
+            if (!symbolIsWeakDef(sym) and !symbolIsPext(sym)) {
+                log.err("symbol '{s}' defined multiple times", .{sym_name});
+                if (global.ref.file) |file| {
+                    log.err("  first definition in '{s}'", .{self.objects.items[file].name});
+                }
+                log.err("  next definition in '{s}'", .{object.name});
+                return error.MultipleSymbolDefinitions;
+            }
+        } else {
+            _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.globs.getIndex(n_strx).?));
+        }
 
-            // Update resolved global
-            global.nlist = .{
-                .n_strx = n_strx,
-                .n_type = sym.n_type,
-                .n_sect = sym.n_sect,
-                .n_desc = sym.n_desc,
-                .n_value = sym.n_value,
-            };
-            const ref = try self.base.allocator.create(Glob.Ref);
-            errdefer self.base.allocator.destroy(ref);
-            try self.managed_refs.append(self.base.allocator, ref);
-            ref.* = .{
-                .sym_index = sym_id,
-                .file = object_id,
-                .next = global.ref,
-                .prev = null,
-            };
-            global.ref.prev = ref;
-            global.ref = ref;
-        } else if (symbolIsTentative(sym)) {
+        // Update resolved global
+        global.nlist = .{
+            .n_strx = n_strx,
+            .n_type = sym.n_type,
+            .n_sect = sym.n_sect,
+            .n_desc = sym.n_desc,
+            .n_value = sym.n_value,
+        };
+        const ref = try self.base.allocator.create(Glob.Ref);
+        errdefer self.base.allocator.destroy(ref);
+        try self.managed_refs.append(self.base.allocator, ref);
+        ref.* = .{
+            .sym_index = sym_id,
+            .file = object_id,
+            .next = global.ref,
+            .prev = null,
+        };
+        global.ref.prev = ref;
+        global.ref = ref;
+    }
+
+    for (object.undefs.items) |sym, id| {
+        const sym_id = @intCast(u32, id);
+        const sym_name = object.getString(sym.n_strx);
+
+        if (symbolIsTentative(sym)) {
             // Symbol is a tentative definition.
             const n_strx = try self.makeString(sym_name);
             const global = self.globs.getPtr(n_strx) orelse {
@@ -2488,7 +2484,7 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                 continue;
             }
             if (!symbolIsTentative(global.nlist)) {
-                _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.symbol_resolver.getIndex(n_strx).?));
+                _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.globs.getIndex(n_strx).?));
             }
 
             const ref = try self.base.allocator.create(Glob.Ref);
@@ -5204,9 +5200,7 @@ fn logSymtab(self: MachO) !void {
     log.warn("locals:", .{});
     for (self.objects.items) |object| {
         log.warn("  {s}", .{object.name});
-        for (object.symtab.items) |sym, i| {
-            if (!symbolIsSect(sym)) continue;
-            if (symbolIsExt(sym)) continue;
+        for (object.locals.items) |sym, i| {
             log.warn("    {d}: {s}", .{ i, object.getString(sym.n_strx) });
         }
     }

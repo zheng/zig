@@ -44,8 +44,12 @@ dwarf_debug_str_index: ?u16 = null,
 dwarf_debug_line_index: ?u16 = null,
 dwarf_debug_ranges_index: ?u16 = null,
 
-symtab: std.ArrayListUnmanaged(macho.nlist_64) = .{},
+locals: std.ArrayListUnmanaged(macho.nlist_64) = .{},
+globals: std.ArrayListUnmanaged(macho.nlist_64) = .{},
+undefs: std.ArrayListUnmanaged(macho.nlist_64) = .{},
+symtab: std.AutoArrayHashMapUnmanaged(u32, u32) = .{},
 strtab: std.ArrayListUnmanaged(u8) = .{},
+
 data_in_code_entries: std.ArrayListUnmanaged(macho.data_in_code_entry) = .{},
 
 // Debug info
@@ -136,6 +140,9 @@ pub fn deinit(self: *Object, allocator: *Allocator) void {
     }
     self.load_commands.deinit(allocator);
     self.data_in_code_entries.deinit(allocator);
+    self.locals.deinit(allocator);
+    self.globals.deinit(allocator);
+    self.undefs.deinit(allocator);
     self.symtab.deinit(allocator);
     self.strtab.deinit(allocator);
     self.sections_as_symbols.deinit(allocator);
@@ -555,16 +562,46 @@ fn parseSymtab(self: *Object, allocator: *Allocator) !void {
     const index = self.symtab_cmd_index orelse return;
     const symtab_cmd = self.load_commands.items[index].Symtab;
 
-    var symtab = try allocator.alloc(u8, @sizeOf(macho.nlist_64) * symtab_cmd.nsyms);
-    defer allocator.free(symtab);
-    _ = try self.file.preadAll(symtab, symtab_cmd.symoff);
-    const slice = @alignCast(@alignOf(macho.nlist_64), mem.bytesAsSlice(macho.nlist_64, symtab));
-    try self.symtab.appendSlice(allocator, slice);
-
     var strtab = try allocator.alloc(u8, symtab_cmd.strsize);
     defer allocator.free(strtab);
     _ = try self.file.preadAll(strtab, symtab_cmd.stroff);
     try self.strtab.appendSlice(allocator, strtab);
+
+    var symtab = try allocator.alloc(u8, @sizeOf(macho.nlist_64) * symtab_cmd.nsyms);
+    defer allocator.free(symtab);
+    _ = try self.file.preadAll(symtab, symtab_cmd.symoff);
+    const slice = @alignCast(@alignOf(macho.nlist_64), mem.bytesAsSlice(macho.nlist_64, symtab));
+    try self.symtab.ensureTotalCapacity(allocator, slice.len);
+
+    for (slice) |sym, id| {
+        if (MachO.symbolIsStab(sym)) {
+            const sym_name = self.getString(sym.n_strx);
+            log.err("unhandled symbol type: stab", .{});
+            log.err("  symbol '{s}'", .{sym_name});
+            log.err("  first definition in '{s}'", .{self.name});
+            return error.UnhandledSymbolType;
+        }
+
+        const sym_index = blk: {
+            if (MachO.symbolIsSect(sym) and !MachO.symbolIsExt(sym)) {
+                // Local to object.
+                const sym_index = @intCast(u32, self.locals.items.len);
+                try self.locals.append(allocator, sym);
+                break :blk sym_index;
+            } else if (MachO.symbolIsSect(sym)) {
+                // Global symbol.
+                const sym_index = @intCast(u32, self.globals.items.len);
+                try self.globals.append(allocator, sym);
+                break :blk sym_index;
+            } else {
+                // Undefined symbol.
+                const sym_index = @intCast(u32, self.undefs.items.len);
+                try self.undefs.append(allocator, sym);
+                break :blk sym_index;
+            }
+        };
+        self.symtab.putAssumeCapacityNoClobber(@intCast(u32, id), sym_index);
+    }
 }
 
 pub fn parseDebugInfo(self: *Object, allocator: *Allocator) !void {
