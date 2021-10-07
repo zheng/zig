@@ -140,9 +140,8 @@ objc_data_section_index: ?u16 = null,
 bss_file_offset: u32 = 0,
 tlv_bss_file_offset: u32 = 0,
 
-symtab: std.ArrayListUnmanaged(macho.nlist_64) = .{},
-globs: std.AutoArrayHashMapUnmanaged(u32, Glob) = .{},
-managed_refs: std.ArrayListUnmanaged(*Glob.Ref) = .{},
+refs: std.AutoArrayHashMapUnmanaged(u32, *Ref) = .{},
+managed_refs: std.ArrayListUnmanaged(*Ref) = .{},
 
 locals: std.ArrayListUnmanaged(macho.nlist_64) = .{},
 globals: std.ArrayListUnmanaged(macho.nlist_64) = .{},
@@ -227,24 +226,32 @@ const PendingUpdate = union(enum) {
     add_got_entry: u32,
 };
 
-const Glob = struct {
-    nlist: macho.nlist_64,
-    ref: *Ref,
+const Ref = struct {
+    loc: union(enum) {
+        global: u32,
+        undef: u32,
+    },
+    file: ?u16,
+    next: ?*Ref,
+    prev: ?*Ref,
 
-    const Ref = struct {
-        sym_index: u32,
-        file: ?u16,
-        next: ?*Ref,
-        prev: ?*Ref,
+    fn nlist(self: Ref, macho_file: *MachO) macho.nlist_64 {
+        return self.nlistPtr(macho_file).*;
+    }
 
-        fn nlistPtr(self: Ref, elf_file: *Elf) *macho.nlist_64 {
-            if (self.file) |file| {
-                const object = &elf_file.objects.items[file];
-                return &object.symtab.items[self.sym_index];
-            }
-            return &elf_file.symtab.items[self.sym_index];
+    fn nlistPtr(self: Ref, macho_file: *MachO) *macho.nlist_64 {
+        if (self.file) |file| {
+            const object = &macho_file.objects.items[file];
+            return switch (self.loc) {
+                .global => |sym_index| &object.globals.items[sym_index],
+                .undef => |sym_index| &object.undefs.items[sym_index],
+            };
         }
-    };
+        return switch (self.loc) {
+            .global => |sym_index| &macho_file.globals.items[sym_index],
+            .undef => |sym_index| &macho_file.undefs.items[sym_index],
+        };
+    }
 };
 
 const SymbolWithLoc = struct {
@@ -859,7 +866,7 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         // try self.resolveDyldStubBinder();
         // try self.createDyldPrivateAtom();
         // try self.createStubHelperPreambleAtom();
-        // try self.resolveSymbolsInDylibs();
+        try self.resolveSymbolsInDylibs();
         // try self.createDsoHandleAtom();
         // try self.addCodeSignatureLC();
 
@@ -2363,79 +2370,65 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
         }
 
         const n_strx = try self.makeString(sym_name);
-        const global = self.globs.getPtr(n_strx) orelse {
-            const ref = try self.base.allocator.create(Glob.Ref);
+        const global_ref = self.refs.getPtr(n_strx) orelse {
+            const ref = try self.base.allocator.create(Ref);
             errdefer self.base.allocator.destroy(ref);
             try self.managed_refs.append(self.base.allocator, ref);
             ref.* = .{
-                .sym_index = sym_id,
+                .loc = .{ .global = sym_id },
                 .file = object_id,
                 .next = null,
                 .prev = null,
             };
-            try self.globs.putNoClobber(self.base.allocator, n_strx, .{
-                .nlist = .{
-                    .n_strx = n_strx,
-                    .n_type = sym.n_type,
-                    .n_sect = sym.n_sect,
-                    .n_desc = sym.n_desc,
-                    .n_value = sym.n_value,
-                },
-                .ref = ref,
-            });
+            try self.refs.putNoClobber(self.base.allocator, n_strx, ref);
             continue;
         };
+        const global = global_ref.*;
+        const global_nlist = global.nlist(self);
 
-        if (symbolIsSect(global.nlist)) {
+        if (symbolIsSect(global_nlist)) {
             // Global resolved is defined, so:
             // 1. skip it if current is weak
             // 2. flag collision if both are strong
             // 3. fall-through otherwise (and update in shared code)
             if (symbolIsWeakDef(sym) or symbolIsPext(sym)) {
                 // Current symbol is weak, so lower priority.
-                const ref = try self.base.allocator.create(Glob.Ref);
+                const ref = try self.base.allocator.create(Ref);
                 errdefer self.base.allocator.destroy(ref);
                 try self.managed_refs.append(self.base.allocator, ref);
                 ref.* = .{
-                    .sym_index = sym_id,
+                    .loc = .{ .global = sym_id },
                     .file = object_id,
                     .next = null,
-                    .prev = global.ref,
+                    .prev = global,
                 };
-                global.ref.next = ref;
+                global.next = ref;
                 continue;
             }
             if (!symbolIsWeakDef(sym) and !symbolIsPext(sym)) {
                 log.err("symbol '{s}' defined multiple times", .{sym_name});
-                if (global.ref.file) |file| {
+                if (global.file) |file| {
                     log.err("  first definition in '{s}'", .{self.objects.items[file].name});
                 }
                 log.err("  next definition in '{s}'", .{object.name});
                 return error.MultipleSymbolDefinitions;
             }
         } else {
-            _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.globs.getIndex(n_strx).?));
+            _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?));
         }
 
         // Update resolved global
-        global.nlist = .{
-            .n_strx = n_strx,
-            .n_type = sym.n_type,
-            .n_sect = sym.n_sect,
-            .n_desc = sym.n_desc,
-            .n_value = sym.n_value,
-        };
-        const ref = try self.base.allocator.create(Glob.Ref);
+        const ref = try self.base.allocator.create(Ref);
         errdefer self.base.allocator.destroy(ref);
         try self.managed_refs.append(self.base.allocator, ref);
         ref.* = .{
-            .sym_index = sym_id,
+            .loc = .{ .global = sym_id },
             .file = object_id,
-            .next = global.ref,
+            .next = global,
             .prev = null,
         };
-        global.ref.prev = ref;
-        global.ref = ref;
+        global.prev = ref;
+        global_ref.* = ref;
     }
 
     for (object.undefs.items) |sym, id| {
@@ -2445,96 +2438,80 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
         if (symbolIsTentative(sym)) {
             // Symbol is a tentative definition.
             const n_strx = try self.makeString(sym_name);
-            const global = self.globs.getPtr(n_strx) orelse {
-                const ref = try self.base.allocator.create(Glob.Ref);
+            const global_ref = self.refs.getPtr(n_strx) orelse {
+                const ref = try self.base.allocator.create(Ref);
                 errdefer self.base.allocator.destroy(ref);
                 try self.managed_refs.append(self.base.allocator, ref);
                 ref.* = .{
-                    .sym_index = sym_id,
+                    .loc = .{ .undef = sym_id },
                     .file = object_id,
                     .next = null,
                     .prev = null,
                 };
-                try self.globs.putNoClobber(self.base.allocator, n_strx, .{
-                    .nlist = .{
-                        .n_strx = n_strx,
-                        .n_type = sym.n_type,
-                        .n_sect = sym.n_sect,
-                        .n_desc = sym.n_desc,
-                        .n_value = sym.n_value,
-                    },
-                    .ref = ref,
-                });
+                try self.refs.putNoClobber(self.base.allocator, n_strx, ref);
                 continue;
             };
+            const global = global_ref.*;
+            const global_nlist = global.nlist(self);
 
-            if (symbolIsSect(global.nlist) or
-                (symbolIsTentative(global.nlist) and global.nlist.n_value >= sym.n_value))
+            if (symbolIsSect(global_nlist) or
+                (symbolIsTentative(global_nlist) and global_nlist.n_value >= sym.n_value))
             {
-                const ref = try self.base.allocator.create(Glob.Ref);
+                const ref = try self.base.allocator.create(Ref);
                 errdefer self.base.allocator.destroy(ref);
                 try self.managed_refs.append(self.base.allocator, ref);
                 ref.* = .{
-                    .sym_index = sym_id,
+                    .loc = .{ .undef = sym_id },
                     .file = object_id,
                     .next = null,
-                    .prev = global.ref,
+                    .prev = global,
                 };
-                global.ref.next = ref;
+                global.next = ref;
                 continue;
             }
-            if (!symbolIsTentative(global.nlist)) {
-                _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.globs.getIndex(n_strx).?));
+            if (!symbolIsTentative(global_nlist)) {
+                _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?));
             }
 
-            const ref = try self.base.allocator.create(Glob.Ref);
+            const ref = try self.base.allocator.create(Ref);
             errdefer self.base.allocator.destroy(ref);
             try self.managed_refs.append(self.base.allocator, ref);
             ref.* = .{
-                .sym_index = sym_id,
+                .loc = .{ .undef = sym_id },
                 .file = object_id,
-                .next = global.ref,
+                .next = global,
                 .prev = null,
             };
-            global.ref.prev = ref;
-            global.ref = ref;
+            global.prev = ref;
+            global_ref.* = ref;
         } else {
             // Symbol is undefined.
             const n_strx = try self.makeString(sym_name);
-            if (self.globs.getPtr(n_strx)) |global| {
-                const ref = try self.base.allocator.create(Glob.Ref);
+            if (self.refs.get(n_strx)) |global| {
+                const ref = try self.base.allocator.create(Ref);
                 errdefer self.base.allocator.destroy(ref);
                 try self.managed_refs.append(self.base.allocator, ref);
                 ref.* = .{
-                    .sym_index = sym_id,
+                    .loc = .{ .undef = sym_id },
                     .file = object_id,
                     .next = null,
-                    .prev = global.ref,
+                    .prev = global,
                 };
-                global.ref.next = ref;
+                global.next = ref;
             } else {
-                const ref = try self.base.allocator.create(Glob.Ref);
+                const ref = try self.base.allocator.create(Ref);
                 errdefer self.base.allocator.destroy(ref);
                 try self.managed_refs.append(self.base.allocator, ref);
                 ref.* = .{
-                    .sym_index = sym_id,
+                    .loc = .{ .undef = sym_id },
                     .file = object_id,
                     .next = null,
                     .prev = null,
                 };
-                try self.globs.putNoClobber(self.base.allocator, n_strx, .{
-                    .nlist = .{
-                        .n_strx = n_strx,
-                        .n_type = sym.n_type,
-                        .n_sect = sym.n_sect,
-                        .n_desc = sym.n_desc,
-                        .n_value = sym.n_value,
-                    },
-                    .ref = ref,
-                });
+                try self.refs.putNoClobber(self.base.allocator, n_strx, ref);
                 try self.unresolved.putNoClobber(
                     self.base.allocator,
-                    @intCast(u32, self.globs.getIndex(n_strx).?),
+                    @intCast(u32, self.refs.getIndex(n_strx).?),
                     .none,
                 );
             }
@@ -2547,7 +2524,7 @@ fn resolveSymbolsInArchives(self: *MachO) !void {
 
     var next_sym: usize = 0;
     loop: while (next_sym < self.unresolved.count()) {
-        const n_strx = self.globs.keys()[self.unresolved.keys()[next_sym]];
+        const n_strx = self.refs.keys()[self.unresolved.keys()[next_sym]];
         const sym_name = self.getString(n_strx);
 
         for (self.archives.items) |archive| {
@@ -2575,7 +2552,7 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
 
     var next_sym: usize = 0;
     loop: while (next_sym < self.unresolved.count()) {
-        const n_strx = self.symbol_resolver.keys()[self.unresolved.keys()[next_sym]];
+        const n_strx = self.refs.keys()[self.unresolved.keys()[next_sym]];
         const sym_name = self.getString(n_strx);
 
         for (self.dylibs.items) |dylib, id| {
@@ -2588,61 +2565,79 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
             }
 
             const ordinal = self.referenced_dylibs.getIndex(dylib_id) orelse unreachable;
-            const resolv = self.symbol_resolver.getPtr(n_strx) orelse unreachable;
-            const undef = &self.undefs.items[resolv.where_index];
-            undef.n_type |= macho.N_EXT;
-            undef.n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER;
+            const global_ref = self.refs.getPtr(n_strx) orelse unreachable;
+            const global = global_ref.*;
+            const undef_sym_index = @intCast(u32, self.undefs.items.len);
+            try self.undefs.append(self.base.allocator, .{
+                .n_strx = n_strx,
+                .n_type = macho.N_UNDF | macho.N_EXT,
+                .n_sect = 0,
+                .n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER,
+                .n_value = 0,
+            });
+            const ref = try self.base.allocator.create(Ref);
+            errdefer self.base.allocator.destroy(ref);
+            try self.managed_refs.append(self.base.allocator, ref);
+            ref.* = .{
+                .loc = .{ .undef = undef_sym_index },
+                .file = null,
+                .next = global,
+                .prev = null,
+            };
+            global.prev = ref;
+            global_ref.* = ref;
 
-            if (self.unresolved.fetchSwapRemove(resolv.where_index)) |entry| outer_blk: {
+            if (self.unresolved.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?))) |entry| {
                 switch (entry.value) {
                     .none => {},
-                    .got => return error.TODOGotHint,
-                    .stub => {
-                        if (self.stubs_map.contains(resolv.where_index)) break :outer_blk;
-                        const stub_helper_atom = blk: {
-                            const match = MatchingSection{
-                                .seg = self.text_segment_cmd_index.?,
-                                .sect = self.stub_helper_section_index.?,
-                            };
-                            const atom = try self.createStubHelperAtom();
-                            const atom_sym = &self.locals.items[atom.local_sym_index];
-                            const alignment = try math.powi(u32, 2, atom.alignment);
-                            const vaddr = try self.allocateAtom(atom, atom.size, alignment, match);
-                            atom_sym.n_value = vaddr;
-                            atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-                            break :blk atom;
-                        };
-                        const laptr_atom = blk: {
-                            const match = MatchingSection{
-                                .seg = self.data_segment_cmd_index.?,
-                                .sect = self.la_symbol_ptr_section_index.?,
-                            };
-                            const atom = try self.createLazyPointerAtom(
-                                stub_helper_atom.local_sym_index,
-                                resolv.where_index,
-                            );
-                            const atom_sym = &self.locals.items[atom.local_sym_index];
-                            const alignment = try math.powi(u32, 2, atom.alignment);
-                            const vaddr = try self.allocateAtom(atom, atom.size, alignment, match);
-                            atom_sym.n_value = vaddr;
-                            atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-                            break :blk atom;
-                        };
-                        const stub_atom = blk: {
-                            const match = MatchingSection{
-                                .seg = self.text_segment_cmd_index.?,
-                                .sect = self.stubs_section_index.?,
-                            };
-                            const atom = try self.createStubAtom(laptr_atom.local_sym_index);
-                            const atom_sym = &self.locals.items[atom.local_sym_index];
-                            const alignment = try math.powi(u32, 2, atom.alignment);
-                            const vaddr = try self.allocateAtom(atom, atom.size, alignment, match);
-                            atom_sym.n_value = vaddr;
-                            atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-                            break :blk atom;
-                        };
-                        try self.stubs_map.putNoClobber(self.base.allocator, resolv.where_index, stub_atom);
-                    },
+                    else => return error.TODOHints,
+                    // .got => return error.TODOGotHint,
+                    // .stub => {
+                    //     if (self.stubs_map.contains(resolv.where_index)) break :outer_blk;
+                    //     const stub_helper_atom = blk: {
+                    //         const match = MatchingSection{
+                    //             .seg = self.text_segment_cmd_index.?,
+                    //             .sect = self.stub_helper_section_index.?,
+                    //         };
+                    //         const atom = try self.createStubHelperAtom();
+                    //         const atom_sym = &self.locals.items[atom.local_sym_index];
+                    //         const alignment = try math.powi(u32, 2, atom.alignment);
+                    //         const vaddr = try self.allocateAtom(atom, atom.size, alignment, match);
+                    //         atom_sym.n_value = vaddr;
+                    //         atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+                    //         break :blk atom;
+                    //     };
+                    //     const laptr_atom = blk: {
+                    //         const match = MatchingSection{
+                    //             .seg = self.data_segment_cmd_index.?,
+                    //             .sect = self.la_symbol_ptr_section_index.?,
+                    //         };
+                    //         const atom = try self.createLazyPointerAtom(
+                    //             stub_helper_atom.local_sym_index,
+                    //             resolv.where_index,
+                    //         );
+                    //         const atom_sym = &self.locals.items[atom.local_sym_index];
+                    //         const alignment = try math.powi(u32, 2, atom.alignment);
+                    //         const vaddr = try self.allocateAtom(atom, atom.size, alignment, match);
+                    //         atom_sym.n_value = vaddr;
+                    //         atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+                    //         break :blk atom;
+                    //     };
+                    //     const stub_atom = blk: {
+                    //         const match = MatchingSection{
+                    //             .seg = self.text_segment_cmd_index.?,
+                    //             .sect = self.stubs_section_index.?,
+                    //         };
+                    //         const atom = try self.createStubAtom(laptr_atom.local_sym_index);
+                    //         const atom_sym = &self.locals.items[atom.local_sym_index];
+                    //         const alignment = try math.powi(u32, 2, atom.alignment);
+                    //         const vaddr = try self.allocateAtom(atom, atom.size, alignment, match);
+                    //         atom_sym.n_value = vaddr;
+                    //         atom_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+                    //         break :blk atom;
+                    //     };
+                    //     try self.stubs_map.putNoClobber(self.base.allocator, resolv.where_index, stub_atom);
+                    // },
                 }
             }
 
@@ -2921,8 +2916,7 @@ pub fn deinit(self: *MachO) void {
         self.base.allocator.destroy(ref);
     }
     self.managed_refs.deinit(self.base.allocator);
-    self.globs.deinit(self.base.allocator);
-    self.symtab.deinit(self.base.allocator);
+    self.refs.deinit(self.base.allocator);
 
     self.section_ordinals.deinit(self.base.allocator);
     self.got_entries_map.deinit(self.base.allocator);
@@ -5205,22 +5199,51 @@ fn logSymtab(self: MachO) !void {
         }
     }
     log.warn("  self-ref", .{});
-    for (self.symtab.items) |sym, i| {
-        if (!symbolIsSect(sym)) continue;
-        if (symbolIsExt(sym)) continue;
+    for (self.locals.items) |sym, i| {
         log.warn("    {d}: {s}", .{ i, self.getString(sym.n_strx) });
     }
 
     log.warn("globals:", .{});
-    for (self.globs.keys()) |n_strx| {
-        const global = self.globs.get(n_strx).?;
-        log.warn("  {s}: {}", .{ self.getString(n_strx), global.nlist });
-        var ref = global.ref;
+    for (self.refs.keys()) |n_strx| {
+        const global = self.refs.get(n_strx).?;
+        if (global.loc != .global) continue;
+        var ref = global;
+        log.warn("  {s}", .{self.getString(n_strx)});
         while (true) {
-            if (ref.file) |file| {
-                log.warn("    => {d}: {s}", .{ ref.sym_index, self.objects.items[file].name });
-            } else {
-                log.warn("    => {d}: null", .{ref.sym_index});
+            switch (ref.loc) {
+                .global => |sym_index| {
+                    if (ref.file) |file| {
+                        const object = self.objects.items[file];
+                        log.warn("    => {d}: {s}", .{ sym_index, object.name });
+                    } else {
+                        log.warn("    => {d}: null", .{sym_index});
+                    }
+                },
+                else => {},
+            }
+            if (ref.next) |next| {
+                ref = next;
+            } else break;
+        }
+    }
+
+    log.warn("undefs:", .{});
+    for (self.refs.keys()) |n_strx| {
+        const global = self.refs.get(n_strx).?;
+        if (global.loc != .undef) continue;
+        var ref = global;
+        log.warn("  {s}", .{self.getString(n_strx)});
+        while (true) {
+            switch (ref.loc) {
+                .undef => |sym_index| {
+                    if (ref.file) |file| {
+                        const object = self.objects.items[file];
+                        log.warn("    => {d}: {s}", .{ sym_index, object.name });
+                    } else {
+                        log.warn("    => {d}: null", .{sym_index});
+                    }
+                },
+                else => {},
             }
             if (ref.next) |next| {
                 ref = next;
