@@ -26,6 +26,8 @@ const StringIndexAdapter = std.hash_map.StringIndexAdapter;
 /// offset table entry.
 local_sym_index: u32,
 
+file: ?u16,
+
 /// List of symbol aliases pointing to the same atom via different nlists
 aliases: std.ArrayListUnmanaged(u32) = .{},
 
@@ -580,6 +582,7 @@ pub const Relocation = struct {
 
 pub const empty = Atom{
     .local_sym_index = 0,
+    .file = null,
     .size = 0,
     .alignment = 0,
     .prev = null,

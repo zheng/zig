@@ -867,7 +867,7 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         try self.createDyldPrivateAtom();
         try self.createStubHelperPreambleAtom();
         try self.resolveSymbolsInDylibs();
-        try self.createDsoHandleAtom();
+        try self.resolveDsoHandle();
         try self.addCodeSignatureLC();
 
         try self.logSymtab();
@@ -2294,7 +2294,7 @@ fn createTentativeDefAtoms(self: *MachO) !void {
     }
 }
 
-fn createDsoHandleAtom(self: *MachO) !void {
+fn resolveDsoHandle(self: *MachO) !void {
     if (self.strtab_dir.getKeyAdapted(@as([]const u8, "___dso_handle"), StringIndexAdapter{
         .bytes = &self.strtab,
     })) |n_strx| blk: {
@@ -2308,13 +2308,15 @@ fn createDsoHandleAtom(self: *MachO) !void {
             .seg = self.text_segment_cmd_index.?,
             .sect = self.text_section_index.?,
         };
+        const seg = self.load_commands.items[match.seg].Segment;
+        const sect = seg.sections.items[match.sect];
         const sym_index = @intCast(u32, self.globals.items.len);
         var nlist = macho.nlist_64{
             .n_strx = undef.n_strx,
             .n_type = macho.N_SECT | macho.N_EXT,
             .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1),
             .n_desc = macho.N_WEAK_DEF,
-            .n_value = 0,
+            .n_value = sect.addr,
         };
         try self.globals.append(self.base.allocator, nlist);
 
@@ -5196,17 +5198,17 @@ pub fn findFirst(comptime T: type, haystack: []T, start: usize, predicate: anyty
     return i;
 }
 
-fn logSymtab(self: MachO) !void {
+fn logSymtab(self: *MachO) !void {
     log.warn("locals:", .{});
     for (self.objects.items) |object| {
         log.warn("  {s}", .{object.name});
         for (object.locals.items) |sym, i| {
-            log.warn("    {d}: {s}", .{ i, object.getString(sym.n_strx) });
+            log.warn("    {d}: {s}: {}", .{ i, object.getString(sym.n_strx), sym });
         }
     }
     log.warn("  self-ref", .{});
     for (self.locals.items) |sym, i| {
-        log.warn("    {d}: {s}", .{ i, self.getString(sym.n_strx) });
+        log.warn("    {d}: {s}: {}", .{ i, self.getString(sym.n_strx), sym });
     }
 
     log.warn("globals:", .{});
@@ -5214,7 +5216,7 @@ fn logSymtab(self: MachO) !void {
         const global = self.refs.get(n_strx).?;
         if (global.loc != .global) continue;
         var ref = global;
-        log.warn("  {s}", .{self.getString(n_strx)});
+        log.warn("  {s}: {}", .{ self.getString(n_strx), ref.nlist(self) });
         while (true) {
             const sym_index = switch (ref.loc) {
                 .global => |sym_index| sym_index,
@@ -5238,7 +5240,7 @@ fn logSymtab(self: MachO) !void {
         const global = self.refs.get(n_strx).?;
         if (global.loc != .undef) continue;
         var ref = global;
-        log.warn("  {s}", .{self.getString(n_strx)});
+        log.warn("  {s}: {}", .{ self.getString(n_strx), ref.nlist(self) });
         while (true) {
             const sym_index = switch (ref.loc) {
                 .global => |sym_index| sym_index,
