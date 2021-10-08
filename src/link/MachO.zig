@@ -868,8 +868,6 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         try self.resolveDsoHandle();
         try self.addCodeSignatureLC();
 
-        try self.logSymtab();
-
         for (self.unresolved.keys()) |index| {
             const sym = self.undefs.items[index];
             const sym_name = self.getString(sym.n_strx);
@@ -884,11 +882,14 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
             return error.UndefinedSymbolReference;
         }
 
-        return error.TODO;
-
-        // try self.createTentativeDefAtoms();
+        try self.createTentativeDefAtoms();
         // try self.parseObjectsIntoAtoms();
         // try self.allocateGlobalSymbols();
+
+        try self.logSymtab();
+
+        return error.TODO;
+
         // try self.writeAtoms();
 
         // if (self.bss_section_index) |idx| {
@@ -1749,7 +1750,7 @@ pub fn getMatchingSection(self: *MachO, sect: macho.section_64) !?MatchingSectio
     return res;
 }
 
-pub fn createEmptyAtom(self: *MachO, local_sym_index: u32, size: u64, alignment: u32) !*Atom {
+pub fn createEmptyAtom(self: *MachO, local_sym_index: u32, file: ?u16, size: u64, alignment: u32) !*Atom {
     const code = try self.base.allocator.alloc(u8, size);
     defer self.base.allocator.free(code);
     mem.set(u8, code, 0);
@@ -1758,6 +1759,7 @@ pub fn createEmptyAtom(self: *MachO, local_sym_index: u32, size: u64, alignment:
     errdefer self.base.allocator.destroy(atom);
     atom.* = Atom.empty;
     atom.local_sym_index = local_sym_index;
+    atom.file = file;
     atom.size = size;
     atom.alignment = alignment;
     try atom.code.appendSlice(self.base.allocator, code);
@@ -1885,7 +1887,7 @@ pub fn createGotAtom(self: *MachO, key: GotIndirectionKey) !*Atom {
         .n_desc = 0,
         .n_value = 0,
     });
-    const atom = try self.createEmptyAtom(local_sym_index, @sizeOf(u64), 3);
+    const atom = try self.createEmptyAtom(local_sym_index, null, @sizeOf(u64), 3);
     switch (key.where) {
         .local => {
             try atom.relocs.append(self.base.allocator, .{
@@ -1923,7 +1925,7 @@ fn createDyldPrivateAtom(self: *MachO) !void {
         .n_desc = 0,
         .n_value = 0,
     };
-    const atom = try self.createEmptyAtom(local_sym_index, @sizeOf(u64), 3);
+    const atom = try self.createEmptyAtom(local_sym_index, null, @sizeOf(u64), 3);
     self.dyld_private_atom = atom;
     const match = MatchingSection{
         .seg = self.data_segment_cmd_index.?,
@@ -1957,7 +1959,7 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
         .n_desc = 0,
         .n_value = 0,
     };
-    const atom = try self.createEmptyAtom(local_sym_index, size, alignment);
+    const atom = try self.createEmptyAtom(local_sym_index, null, size, alignment);
     const dyld_private_sym_index = self.dyld_private_atom.?.local_sym_index;
     switch (arch) {
         .x86_64 => {
@@ -2099,7 +2101,7 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
         .n_desc = 0,
         .n_value = 0,
     });
-    const atom = try self.createEmptyAtom(local_sym_index, stub_size, alignment);
+    const atom = try self.createEmptyAtom(local_sym_index, null, stub_size, alignment);
     try atom.relocs.ensureTotalCapacity(self.base.allocator, 1);
 
     switch (arch) {
@@ -2154,7 +2156,7 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, lazy_binding_sym
         .n_desc = 0,
         .n_value = 0,
     });
-    const atom = try self.createEmptyAtom(local_sym_index, @sizeOf(u64), 3);
+    const atom = try self.createEmptyAtom(local_sym_index, null, @sizeOf(u64), 3);
     try atom.relocs.append(self.base.allocator, .{
         .offset = 0,
         .where = .local,
@@ -2195,7 +2197,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
         .n_desc = 0,
         .n_value = 0,
     });
-    const atom = try self.createEmptyAtom(local_sym_index, stub_size, alignment);
+    const atom = try self.createEmptyAtom(local_sym_index, null, stub_size, alignment);
     switch (arch) {
         .x86_64 => {
             // jmp
@@ -2254,6 +2256,7 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
 
 fn createTentativeDefAtoms(self: *MachO) !void {
     if (self.tentatives.count() == 0) return;
+
     // Convert any tentative definition into a regular symbol and allocate
     // text blocks for each tentative definition.
     while (self.tentatives.popOrNull()) |entry| {
@@ -2263,32 +2266,46 @@ fn createTentativeDefAtoms(self: *MachO) !void {
         };
         _ = try self.section_ordinals.getOrPut(self.base.allocator, match);
 
-        const global_sym = &self.globals.items[entry.key];
+        const n_strx = self.refs.keys()[entry.key];
+        const global_ref = self.refs.getPtr(n_strx).?;
+        const global = global_ref.*;
+
+        const global_sym = global.nlist(self);
         const size = global_sym.n_value;
         const alignment = (global_sym.n_desc >> 8) & 0x0f;
 
-        global_sym.n_value = 0;
-        global_sym.n_desc = 0;
-        global_sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
-
-        const local_sym_index = @intCast(u32, self.locals.items.len);
-        const local_sym = try self.locals.addOne(self.base.allocator);
-        local_sym.* = .{
-            .n_strx = global_sym.n_strx,
+        var sym = macho.nlist_64{
+            .n_strx = n_strx,
             .n_type = macho.N_SECT,
-            .n_sect = global_sym.n_sect,
+            .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1),
             .n_desc = 0,
             .n_value = 0,
         };
 
-        const resolv = self.symbol_resolver.getPtr(local_sym.n_strx) orelse unreachable;
-        resolv.local_sym_index = local_sym_index;
+        const local_sym_index = @intCast(u32, self.locals.items.len);
+        try self.locals.append(self.base.allocator, sym);
+        const global_sym_index = @intCast(u32, self.globals.items.len);
+        sym.n_type |= macho.N_EXT;
+        try self.globals.append(self.base.allocator, sym);
 
-        const atom = try self.createEmptyAtom(local_sym_index, size, alignment);
+        const ref = try self.base.allocator.create(Ref);
+        errdefer self.base.allocator.destroy(ref);
+        try self.managed_refs.append(self.base.allocator, ref);
+        ref.* = .{
+            .sym_type = .global,
+            .sym_index = global_sym_index,
+            .file = null,
+            .next = global,
+            .prev = null,
+        };
+        global.prev = ref;
+        global_ref.* = ref;
+
+        const atom = try self.createEmptyAtom(local_sym_index, null, size, alignment);
         const alignment_pow_2 = try math.powi(u32, 2, alignment);
         const vaddr = try self.allocateAtom(atom, size, alignment_pow_2, match);
-        local_sym.n_value = vaddr;
-        global_sym.n_value = vaddr;
+        self.locals.items[local_sym_index].n_value = vaddr;
+        self.globals.items[global_sym_index].n_value = vaddr;
     }
 }
 
