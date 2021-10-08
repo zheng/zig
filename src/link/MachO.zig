@@ -863,30 +863,30 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         }
 
         try self.resolveSymbolsInArchives();
-        // try self.resolveDyldStubBinder();
-        // try self.createDyldPrivateAtom();
-        // try self.createStubHelperPreambleAtom();
+        try self.resolveDyldStubBinder();
+        try self.createDyldPrivateAtom();
+        try self.createStubHelperPreambleAtom();
         try self.resolveSymbolsInDylibs();
-        // try self.createDsoHandleAtom();
-        // try self.addCodeSignatureLC();
+        try self.createDsoHandleAtom();
+        try self.addCodeSignatureLC();
 
         try self.logSymtab();
 
+        for (self.unresolved.keys()) |index| {
+            const sym = self.undefs.items[index];
+            const sym_name = self.getString(sym.n_strx);
+            const global = self.refs.get(sym.n_strx) orelse unreachable;
+
+            log.err("undefined reference to symbol '{s}'", .{sym_name});
+            if (global.file) |file| {
+                log.err("  first referenced in '{s}'", .{self.objects.items[file].name});
+            }
+        }
+        if (self.unresolved.count() > 0) {
+            return error.UndefinedSymbolReference;
+        }
+
         return error.TODO;
-
-        // for (self.unresolved.keys()) |index| {
-        //     const sym = self.undefs.items[index];
-        //     const sym_name = self.getString(sym.n_strx);
-        //     const resolv = self.symbol_resolver.get(sym.n_strx) orelse unreachable;
-
-        //     log.err("undefined reference to symbol '{s}'", .{sym_name});
-        //     if (resolv.file) |file| {
-        //         log.err("  first referenced in '{s}'", .{self.objects.items[file].name});
-        //     }
-        // }
-        // if (self.unresolved.count() > 0) {
-        //     return error.UndefinedSymbolReference;
-        // }
 
         // try self.createTentativeDefAtoms();
         // try self.parseObjectsIntoAtoms();
@@ -2298,51 +2298,47 @@ fn createDsoHandleAtom(self: *MachO) !void {
     if (self.strtab_dir.getKeyAdapted(@as([]const u8, "___dso_handle"), StringIndexAdapter{
         .bytes = &self.strtab,
     })) |n_strx| blk: {
-        const resolv = self.symbol_resolver.getPtr(n_strx) orelse break :blk;
-        if (resolv.where != .undef) break :blk;
+        const global_ref = self.refs.getPtr(n_strx) orelse break :blk;
+        const global = global_ref.*;
 
-        const undef = &self.undefs.items[resolv.where_index];
+        if (global.loc != .undef) break :blk;
+
+        const undef = &self.undefs.items[global.loc.undef];
         const match: MatchingSection = .{
             .seg = self.text_segment_cmd_index.?,
             .sect = self.text_section_index.?,
         };
-        const local_sym_index = @intCast(u32, self.locals.items.len);
+        const sym_index = @intCast(u32, self.globals.items.len);
         var nlist = macho.nlist_64{
             .n_strx = undef.n_strx,
-            .n_type = macho.N_SECT,
+            .n_type = macho.N_SECT | macho.N_EXT,
             .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1),
-            .n_desc = 0,
+            .n_desc = macho.N_WEAK_DEF,
             .n_value = 0,
         };
-        try self.locals.append(self.base.allocator, nlist);
-        const global_sym_index = @intCast(u32, self.globals.items.len);
-        nlist.n_type |= macho.N_EXT;
-        nlist.n_desc = macho.N_WEAK_DEF;
         try self.globals.append(self.base.allocator, nlist);
 
-        _ = self.unresolved.fetchSwapRemove(resolv.where_index);
+        _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?));
 
-        undef.* = .{
-            .n_strx = 0,
-            .n_type = macho.N_UNDF,
-            .n_sect = 0,
-            .n_desc = 0,
-            .n_value = 0,
+        const ref = try self.base.allocator.create(Ref);
+        errdefer self.base.allocator.destroy(ref);
+        try self.managed_refs.append(self.base.allocator, ref);
+        ref.* = .{
+            .loc = .{ .global = sym_index },
+            .file = null,
+            .next = global,
+            .prev = null,
         };
-        resolv.* = .{
-            .where = .global,
-            .where_index = global_sym_index,
-            .local_sym_index = local_sym_index,
-        };
+        global.prev = ref;
+        global_ref.* = ref;
 
         // We create an empty atom for this symbol.
         // TODO perhaps we should special-case special symbols? Create a separate
         // linked list of atoms?
-        const atom = try self.createEmptyAtom(local_sym_index, 0, 0);
-        const sym = &self.locals.items[local_sym_index];
-        const vaddr = try self.allocateAtom(atom, 0, 1, match);
-        sym.n_value = vaddr;
-        atom.dirty = false; // We don't really want to write it to file.
+        // const atom = try self.createEmptyAtom(local_sym_index, 0, 0);
+        // const vaddr = try self.allocateAtom(atom, 0, 1, match);
+        // self.globals.items[sym_index].n_value = vaddr;
+        // atom.dirty = false; // We don't really want to write it to file.
     }
 }
 
@@ -2413,6 +2409,8 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                 log.err("  next definition in '{s}'", .{object.name});
                 return error.MultipleSymbolDefinitions;
             }
+        } else if (symbolIsTentative(global_nlist)) {
+            _ = self.tentatives.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?));
         } else {
             _ = self.unresolved.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?));
         }
@@ -2449,6 +2447,7 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                     .prev = null,
                 };
                 try self.refs.putNoClobber(self.base.allocator, n_strx, ref);
+                try self.tentatives.putNoClobber(self.base.allocator, @intCast(u32, self.refs.getIndex(n_strx).?), {});
                 continue;
             };
             const global = global_ref.*;
@@ -2660,10 +2659,17 @@ fn resolveDyldStubBinder(self: *MachO) !void {
         .n_desc = 0,
         .n_value = 0,
     });
-    try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-        .where = .undef,
-        .where_index = sym_index,
-    });
+    const ref = try self.base.allocator.create(Ref);
+    errdefer self.base.allocator.destroy(ref);
+    try self.managed_refs.append(self.base.allocator, ref);
+    ref.* = .{
+        .loc = .{ .undef = sym_index },
+        .file = null,
+        .next = null,
+        .prev = null,
+    };
+    try self.refs.putNoClobber(self.base.allocator, n_strx, ref);
+
     const sym = &self.undefs.items[sym_index];
     const sym_name = self.getString(n_strx);
 
@@ -5210,16 +5216,16 @@ fn logSymtab(self: MachO) !void {
         var ref = global;
         log.warn("  {s}", .{self.getString(n_strx)});
         while (true) {
-            switch (ref.loc) {
-                .global => |sym_index| {
-                    if (ref.file) |file| {
-                        const object = self.objects.items[file];
-                        log.warn("    => {d}: {s}", .{ sym_index, object.name });
-                    } else {
-                        log.warn("    => {d}: null", .{sym_index});
-                    }
-                },
-                else => {},
+            const sym_index = switch (ref.loc) {
+                .global => |sym_index| sym_index,
+                .undef => |sym_index| sym_index,
+            };
+            const tt: []const u8 = if (ref.loc == .global) "GLOB" else "UND";
+            if (ref.file) |file| {
+                const object = self.objects.items[file];
+                log.warn("    => ({s}) {d}: {s}", .{ tt, sym_index, object.name });
+            } else {
+                log.warn("    => ({s}) {d}: null", .{ tt, sym_index });
             }
             if (ref.next) |next| {
                 ref = next;
@@ -5234,16 +5240,16 @@ fn logSymtab(self: MachO) !void {
         var ref = global;
         log.warn("  {s}", .{self.getString(n_strx)});
         while (true) {
-            switch (ref.loc) {
-                .undef => |sym_index| {
-                    if (ref.file) |file| {
-                        const object = self.objects.items[file];
-                        log.warn("    => {d}: {s}", .{ sym_index, object.name });
-                    } else {
-                        log.warn("    => {d}: null", .{sym_index});
-                    }
-                },
-                else => {},
+            const sym_index = switch (ref.loc) {
+                .global => |sym_index| sym_index,
+                .undef => |sym_index| sym_index,
+            };
+            const tt: []const u8 = if (ref.loc == .global) "GLOB" else "UND";
+            if (ref.file) |file| {
+                const object = self.objects.items[file];
+                log.warn("    => ({s}) {d}: {s}", .{ tt, sym_index, object.name });
+            } else {
+                log.warn("    => ({s}) {d}: null", .{ tt, sym_index });
             }
             if (ref.next) |next| {
                 ref = next;
