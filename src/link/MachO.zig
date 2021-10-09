@@ -883,7 +883,7 @@ pub fn flush(self: *MachO, comp: *Compilation) !void {
         }
 
         try self.createTentativeDefAtoms();
-        // try self.parseObjectsIntoAtoms();
+        try self.parseObjectsIntoAtoms();
         // try self.allocateGlobalSymbols();
 
         try self.logSymtab();
@@ -1782,16 +1782,25 @@ fn allocateLocalSymbols(self: *MachO, match: MatchingSection, offset: i64) !void
     var atom = self.atoms.get(match) orelse return;
 
     while (true) {
-        const atom_sym = &self.locals.items[atom.local_sym_index];
+        const atom_sym = if (atom.file) |file| blk: {
+            const object = &self.objects.items[file];
+            break :blk &object.symtab.items[atom.local_sym_index];
+        } else &self.locals.items[atom.local_sym_index];
         atom_sym.n_value = @intCast(u64, @intCast(i64, atom_sym.n_value) + offset);
 
         for (atom.aliases.items) |index| {
-            const alias_sym = &self.locals.items[index];
+            const alias_sym = if (atom.file) |file| blk: {
+                const object = &self.objects.items[file];
+                break :blk &object.symtab.items[index];
+            } else &self.locals.items[index];
             alias_sym.n_value = @intCast(u64, @intCast(i64, alias_sym.n_value) + offset);
         }
 
         for (atom.contained.items) |sym_at_off| {
-            const contained_sym = &self.locals.items[sym_at_off.local_sym_index];
+            const contained_sym = if (atom.file) |file| blk: {
+                const object = &self.objects.items[file];
+                break :blk &object.symtab.items[sym_at_off.local_sym_index];
+            } else &self.locals.items[sym_at_off.local_sym_index];
             contained_sym.n_value = @intCast(u64, @intCast(i64, contained_sym.n_value) + offset);
         }
 
@@ -1888,19 +1897,22 @@ pub fn createGotAtom(self: *MachO, key: GotIndirectionKey) !*Atom {
         .n_value = 0,
     });
     const atom = try self.createEmptyAtom(local_sym_index, null, @sizeOf(u64), 3);
+    const r_type: u4 = switch (self.base.options.target.cpu.arch) {
+        .aarch64 => @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_UNSIGNED),
+        .x86_64 => @enumToInt(macho.reloc_type_x86_64.X86_64_RELOC_UNSIGNED),
+        else => unreachable,
+    };
     switch (key.where) {
         .local => {
             try atom.relocs.append(self.base.allocator, .{
-                .offset = 0,
-                .where = .local,
-                .where_index = key.where_index,
-                .payload = .{
-                    .unsigned = .{
-                        .subtractor = null,
-                        .addend = 0,
-                        .is_64bit = true,
-                    },
-                },
+                .r_offset = 0,
+                .r_addend = 0,
+                .r_symbolnum = key.where_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = false,
+                .r_length = 3,
+                .r_extern = true,
+                .r_type = r_type,
             });
             try atom.rebases.append(self.base.allocator, 0);
         },
@@ -1969,15 +1981,14 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[1] = 0x8d;
             atom.code.items[2] = 0x1d;
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 3,
-                .where = .local,
-                .where_index = dyld_private_sym_index,
-                .payload = .{
-                    .signed = .{
-                        .addend = 0,
-                        .correction = 0,
-                    },
-                },
+                .r_offset = 3,
+                .r_addend = 0,
+                .r_symbolnum = dyld_private_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_x86_64.X86_64_RELOC_SIGNED),
             });
             // push %r11
             atom.code.items[7] = 0x41;
@@ -1986,15 +1997,14 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             atom.code.items[9] = 0xff;
             atom.code.items[10] = 0x25;
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 11,
-                .where = .undef,
-                .where_index = self.dyld_stub_binder_index.?,
-                .payload = .{
-                    .load = .{
-                        .kind = .got,
-                        .addend = 0,
-                    },
-                },
+                .r_offset = 11,
+                .r_addend = 0,
+                .r_symbolnum = self.dyld_stub_binder_index.?,
+                .r_zig_symtab_hint = .undef,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_x86_64.X86_64_RELOC_BRANCH),
             });
         },
         .aarch64 => {
@@ -2002,29 +2012,26 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             // adrp x17, 0
             mem.writeIntLittle(u32, atom.code.items[0..][0..4], aarch64.Instruction.adrp(.x17, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 0,
-                .where = .local,
-                .where_index = dyld_private_sym_index,
-                .payload = .{
-                    .page = .{
-                        .kind = .page,
-                        .addend = 0,
-                    },
-                },
+                .r_offset = 0,
+                .r_addend = 0,
+                .r_symbolnum = dyld_private_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_PAGE21),
             });
             // add x17, x17, 0
             mem.writeIntLittle(u32, atom.code.items[4..][0..4], aarch64.Instruction.add(.x17, .x17, 0, false).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 4,
-                .where = .local,
-                .where_index = dyld_private_sym_index,
-                .payload = .{
-                    .page_off = .{
-                        .kind = .page,
-                        .addend = 0,
-                        .op_kind = .arithmetic,
-                    },
-                },
+                .r_offset = 4,
+                .r_addend = 0,
+                .r_symbolnum = dyld_private_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = false,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_PAGEOFF12),
             });
             // stp x16, x17, [sp, #-16]!
             mem.writeIntLittle(u32, atom.code.items[8..][0..4], aarch64.Instruction.stp(
@@ -2036,15 +2043,14 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
             // adrp x16, 0
             mem.writeIntLittle(u32, atom.code.items[12..][0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 12,
-                .where = .undef,
-                .where_index = self.dyld_stub_binder_index.?,
-                .payload = .{
-                    .page = .{
-                        .kind = .got,
-                        .addend = 0,
-                    },
-                },
+                .r_offset = 12,
+                .r_addend = 0,
+                .r_symbolnum = self.dyld_stub_binder_index.?,
+                .r_zig_symtab_hint = .undef,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_GOT_LOAD_PAGE21),
             });
             // ldr x16, [x16, 0]
             mem.writeIntLittle(u32, atom.code.items[16..][0..4], aarch64.Instruction.ldr(.x16, .{
@@ -2054,15 +2060,14 @@ fn createStubHelperPreambleAtom(self: *MachO) !void {
                 },
             }).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 16,
-                .where = .undef,
-                .where_index = self.dyld_stub_binder_index.?,
-                .payload = .{
-                    .page_off = .{
-                        .kind = .got,
-                        .addend = 0,
-                    },
-                },
+                .r_offset = 16,
+                .r_addend = 0,
+                .r_symbolnum = self.dyld_stub_binder_index.?,
+                .r_zig_symtab_hint = .undef,
+                .r_pcrel = false,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_GOT_LOAD_PAGEOFF12),
             });
             // br x16
             mem.writeIntLittle(u32, atom.code.items[20..][0..4], aarch64.Instruction.br(.x16).toU32());
@@ -2112,12 +2117,14 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
             // jmpq
             atom.code.items[5] = 0xe9;
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 6,
-                .where = .local,
-                .where_index = self.stub_helper_preamble_atom.?.local_sym_index,
-                .payload = .{
-                    .branch = .{ .arch = arch },
-                },
+                .r_offset = 6,
+                .r_addend = 0,
+                .r_symbolnum = self.stub_helper_preamble_atom.?.local_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = false,
+                .r_type = @enumToInt(macho.reloc_type_x86_64.X86_64_RELOC_BRANCH),
             });
         },
         .aarch64 => {
@@ -2132,12 +2139,14 @@ pub fn createStubHelperAtom(self: *MachO) !*Atom {
             // b disp
             mem.writeIntLittle(u32, atom.code.items[4..8], aarch64.Instruction.b(0).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 4,
-                .where = .local,
-                .where_index = self.stub_helper_preamble_atom.?.local_sym_index,
-                .payload = .{
-                    .branch = .{ .arch = arch },
-                },
+                .r_offset = 4,
+                .r_addend = 0,
+                .r_symbolnum = self.stub_helper_preamble_atom.?.local_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_BRANCH26),
             });
             // Next 4 bytes 8..12 are just a placeholder populated in `populateLazyBindOffsetsInStubHelper`.
         },
@@ -2157,17 +2166,20 @@ pub fn createLazyPointerAtom(self: *MachO, stub_sym_index: u32, lazy_binding_sym
         .n_value = 0,
     });
     const atom = try self.createEmptyAtom(local_sym_index, null, @sizeOf(u64), 3);
+    const r_type: u4 = switch (self.base.options.target.cpu.arch) {
+        .aarch64 => @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_UNSIGNED),
+        .x86_64 => @enumToInt(macho.reloc_type_x86_64.X86_64_RELOC_UNSIGNED),
+        else => unreachable,
+    };
     try atom.relocs.append(self.base.allocator, .{
-        .offset = 0,
-        .where = .local,
-        .where_index = stub_sym_index,
-        .payload = .{
-            .unsigned = .{
-                .subtractor = null,
-                .addend = 0,
-                .is_64bit = true,
-            },
-        },
+        .r_offset = 0,
+        .r_addend = 0,
+        .r_symbolnum = stub_sym_index,
+        .r_zig_symtab_hint = .local,
+        .r_pcrel = false,
+        .r_length = 3,
+        .r_extern = true,
+        .r_type = r_type,
     });
     try atom.rebases.append(self.base.allocator, 0);
     try atom.lazy_bindings.append(self.base.allocator, .{
@@ -2204,12 +2216,14 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             atom.code.items[0] = 0xff;
             atom.code.items[1] = 0x25;
             try atom.relocs.append(self.base.allocator, .{
-                .offset = 2,
-                .where = .local,
-                .where_index = laptr_sym_index,
-                .payload = .{
-                    .branch = .{ .arch = arch },
-                },
+                .r_offset = 2,
+                .r_addend = 0,
+                .r_symbolnum = laptr_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_x86_64.X86_64_RELOC_BRANCH),
             });
         },
         .aarch64 => {
@@ -2217,15 +2231,14 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
             // adrp x16, pages
             mem.writeIntLittle(u32, atom.code.items[0..4], aarch64.Instruction.adrp(.x16, 0).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 0,
-                .where = .local,
-                .where_index = laptr_sym_index,
-                .payload = .{
-                    .page = .{
-                        .kind = .page,
-                        .addend = 0,
-                    },
-                },
+                .r_offset = 0,
+                .r_addend = 0,
+                .r_symbolnum = laptr_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = true,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_PAGE21),
             });
             // ldr x16, x16, offset
             mem.writeIntLittle(u32, atom.code.items[4..8], aarch64.Instruction.ldr(.x16, .{
@@ -2235,16 +2248,14 @@ pub fn createStubAtom(self: *MachO, laptr_sym_index: u32) !*Atom {
                 },
             }).toU32());
             atom.relocs.appendAssumeCapacity(.{
-                .offset = 4,
-                .where = .local,
-                .where_index = laptr_sym_index,
-                .payload = .{
-                    .page_off = .{
-                        .kind = .page,
-                        .addend = 0,
-                        .op_kind = .load,
-                    },
-                },
+                .r_offset = 4,
+                .r_addend = 0,
+                .r_symbolnum = laptr_sym_index,
+                .r_zig_symtab_hint = .local,
+                .r_pcrel = false,
+                .r_length = 2,
+                .r_extern = true,
+                .r_type = @enumToInt(macho.reloc_type_arm64.ARM64_RELOC_PAGEOFF12),
             });
             // br x16
             mem.writeIntLittle(u32, atom.code.items[8..12], aarch64.Instruction.br(.x16).toU32());
@@ -2585,28 +2596,17 @@ fn resolveSymbolsInDylibs(self: *MachO) !void {
             }
 
             const ordinal = self.referenced_dylibs.getIndex(dylib_id) orelse unreachable;
-            const global_ref = self.refs.getPtr(n_strx) orelse unreachable;
-            const global = global_ref.*;
-            const undef_sym_index = @intCast(u32, self.undefs.items.len);
-            try self.undefs.append(self.base.allocator, .{
-                .n_strx = n_strx,
-                .n_type = macho.N_UNDF | macho.N_EXT,
-                .n_sect = 0,
-                .n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER,
-                .n_value = 0,
-            });
-            const ref = try self.base.allocator.create(Ref);
-            errdefer self.base.allocator.destroy(ref);
-            try self.managed_refs.append(self.base.allocator, ref);
-            ref.* = .{
-                .sym_type = .undef,
-                .sym_index = undef_sym_index,
-                .file = null,
-                .next = global,
-                .prev = null,
-            };
-            global.prev = ref;
-            global_ref.* = ref;
+
+            var ref = self.refs.get(n_strx).?;
+            while (true) {
+                const object = &self.objects.items[ref.file.?];
+                const sym = &object.symtab.items[ref.sym_index];
+                sym.n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER;
+
+                if (ref.next) |next| {
+                    ref = next;
+                } else break;
+            }
 
             if (self.unresolved.fetchSwapRemove(@intCast(u32, self.refs.getIndex(n_strx).?))) |entry| {
                 switch (entry.value) {
@@ -2752,10 +2752,10 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
     }).init(self.base.allocator);
     defer section_metadata.deinit();
 
-    for (self.objects.items) |*object| {
+    for (self.objects.items) |*object, object_id| {
         if (object.analyzed) continue;
 
-        try object.parseIntoAtoms(self.base.allocator, self);
+        try object.parseIntoAtoms(self.base.allocator, @intCast(u16, object_id), self);
 
         var it = object.end_atoms.iterator();
         while (it.next()) |entry| {
@@ -2776,8 +2776,8 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
                 metadata.value_ptr.size += mem.alignForwardGeneric(u64, atom.size, alignment);
                 metadata.value_ptr.alignment = math.max(metadata.value_ptr.alignment, atom.alignment);
 
-                const sym = self.locals.items[atom.local_sym_index];
-                log.debug("  {s}: n_value=0x{x}, size=0x{x}, alignment=0x{x}", .{
+                const sym = object.symtab.items[atom.local_sym_index];
+                log.warn("  {s}: n_value=0x{x}, size=0x{x}, alignment=0x{x}", .{
                     self.getString(sym.n_strx),
                     sym.n_value,
                     atom.size,
@@ -2810,7 +2810,7 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
         const metadata = entry.value_ptr.*;
         const seg = &self.load_commands.items[match.seg].Segment;
         const sect = &seg.sections.items[match.sect];
-        log.debug("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
+        log.warn("{s},{s} => size: 0x{x}, alignment: 0x{x}", .{
             commands.segmentName(sect.*),
             commands.sectionName(sect.*),
             metadata.size,
@@ -2818,7 +2818,10 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
         });
 
         const sect_size = if (self.atoms.get(match)) |last| blk: {
-            const last_atom_sym = self.locals.items[last.local_sym_index];
+            const last_atom_sym = if (last.file) |file| inner: {
+                const object = self.objects.items[file];
+                break :inner object.symtab.items[last.local_sym_index];
+            } else self.locals.items[last.local_sym_index];
             break :blk last_atom_sym.n_value + last.size - sect.addr;
         } else 0;
 
@@ -2828,7 +2831,10 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
         sect.size = needed_size;
 
         var base_vaddr = if (self.atoms.get(match)) |last| blk: {
-            const last_atom_sym = self.locals.items[last.local_sym_index];
+            const last_atom_sym = if (last.file) |file| inner: {
+                const object = self.objects.items[file];
+                break :inner object.symtab.items[last.local_sym_index];
+            } else self.locals.items[last.local_sym_index];
             break :blk last_atom_sym.n_value + last.size;
         } else sect.addr;
         const n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
@@ -2838,11 +2844,12 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
             const alignment = try math.powi(u32, 2, atom.alignment);
             base_vaddr = mem.alignForwardGeneric(u64, base_vaddr, alignment);
 
-            const sym = &self.locals.items[atom.local_sym_index];
+            const object = &self.objects.items[atom.file.?];
+            const sym = &object.symtab.items[atom.local_sym_index];
             sym.n_value = base_vaddr;
             sym.n_sect = n_sect;
 
-            log.debug("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
+            log.warn("  {s}: start=0x{x}, end=0x{x}, size=0x{x}, alignment=0x{x}", .{
                 self.getString(sym.n_strx),
                 base_vaddr,
                 base_vaddr + atom.size,
@@ -2852,14 +2859,14 @@ fn parseObjectsIntoAtoms(self: *MachO) !void {
 
             // Update each alias (if any)
             for (atom.aliases.items) |index| {
-                const alias_sym = &self.locals.items[index];
+                const alias_sym = &object.symtab.items[index];
                 alias_sym.n_value = base_vaddr;
                 alias_sym.n_sect = n_sect;
             }
 
             // Update each symbol contained within the atom
             for (atom.contained.items) |sym_at_off| {
-                const contained_sym = &self.locals.items[sym_at_off.local_sym_index];
+                const contained_sym = &object.symtab.items[sym_at_off.local_sym_index];
                 contained_sym.n_value = base_vaddr + sym_at_off.offset;
                 contained_sym.n_sect = n_sect;
             }

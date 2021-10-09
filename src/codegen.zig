@@ -3002,35 +3002,48 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     } else if (func_value.castTag(.extern_fn)) |func_payload| {
                         const decl = func_payload.data;
                         const resolv = try macho_file.addExternFn(mem.spanZ(decl.name));
-                        const offset = blk: {
-                            switch (arch) {
-                                .x86_64 => {
-                                    // callq
-                                    try self.code.ensureUnusedCapacity(5);
-                                    self.code.appendSliceAssumeCapacity(&[5]u8{ 0xe8, 0x0, 0x0, 0x0, 0x0 });
-                                    break :blk @intCast(u32, self.code.items.len) - 4;
-                                },
-                                .aarch64 => {
-                                    const offset = @intCast(u32, self.code.items.len);
-                                    // bl
-                                    writeInt(u32, try self.code.addManyAsArray(4), Instruction.bl(0).toU32());
-                                    break :blk offset;
-                                },
-                                else => unreachable, // unsupported architecture on MachO
-                            }
-                        };
-                        // Add relocation to the decl.
-                        try macho_file.active_decl.?.link.macho.relocs.append(self.bin_file.allocator, .{
-                            .offset = offset,
-                            .where = switch (resolv.where) {
-                                .local => .local,
-                                .undef => .undef,
+                        switch (arch) {
+                            .x86_64 => {
+                                // callq
+                                try self.code.ensureUnusedCapacity(5);
+                                self.code.appendSliceAssumeCapacity(&[5]u8{ 0xe8, 0x0, 0x0, 0x0, 0x0 });
+                                const r_offset = @intCast(u32, self.code.items.len) - 4;
+                                // Add relocation to the decl.
+                                try macho_file.active_decl.?.link.macho.relocs.append(self.bin_file.allocator, .{
+                                    .r_offset = r_offset,
+                                    .r_addend = 0,
+                                    .r_symbolnum = resolv.where_index,
+                                    .r_zig_symtab_hint = switch (resolv.where) {
+                                        .local => .local,
+                                        .undef => .undef,
+                                    },
+                                    .r_pcrel = true,
+                                    .r_length = 2,
+                                    .r_extern = true,
+                                    .r_type = @enumToInt(std.macho.reloc_type_x86_64.X86_64_RELOC_BRANCH),
+                                });
                             },
-                            .where_index = resolv.where_index,
-                            .payload = .{ .branch = .{
-                                .arch = arch,
-                            } },
-                        });
+                            .aarch64 => {
+                                const r_offset = @intCast(u32, self.code.items.len);
+                                // bl
+                                writeInt(u32, try self.code.addManyAsArray(4), Instruction.bl(0).toU32());
+                                // Add relocation to the decl.
+                                try macho_file.active_decl.?.link.macho.relocs.append(self.bin_file.allocator, .{
+                                    .r_offset = r_offset,
+                                    .r_addend = 0,
+                                    .r_symbolnum = resolv.where_index,
+                                    .r_zig_symtab_hint = switch (resolv.where) {
+                                        .local => .local,
+                                        .undef => .undef,
+                                    },
+                                    .r_pcrel = true,
+                                    .r_length = 2,
+                                    .r_extern = true,
+                                    .r_type = @enumToInt(std.macho.reloc_type_arm64.ARM64_RELOC_BRANCH26),
+                                });
+                            },
+                            else => unreachable, // unsupported architecture on MachO
+                        }
                     } else {
                         return self.fail("TODO implement calling bitcasted functions", .{});
                     }
@@ -4514,17 +4527,25 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                 const decl = macho_file.active_decl.?;
                                 // Page reloc for adrp instruction.
                                 try decl.link.macho.relocs.append(self.bin_file.allocator, .{
-                                    .offset = offset,
-                                    .where = .local,
-                                    .where_index = @intCast(u32, addr),
-                                    .payload = .{ .page = .{ .kind = .got } },
+                                    .r_offset = offset,
+                                    .r_addend = 0,
+                                    .r_symbolnum = @intCast(u32, addr),
+                                    .r_zig_symtab_hint = .local,
+                                    .r_pcrel = true,
+                                    .r_length = 2,
+                                    .r_extern = true,
+                                    .r_type = @enumToInt(std.macho.reloc_type_arm64.ARM64_RELOC_GOT_LOAD_PAGE21),
                                 });
                                 // Pageoff reloc for adrp instruction.
                                 try decl.link.macho.relocs.append(self.bin_file.allocator, .{
-                                    .offset = offset + 4,
-                                    .where = .local,
-                                    .where_index = @intCast(u32, addr),
-                                    .payload = .{ .page_off = .{ .kind = .got } },
+                                    .r_offset = offset + 4,
+                                    .r_addend = 0,
+                                    .r_symbolnum = @intCast(u32, addr),
+                                    .r_zig_symtab_hint = .local,
+                                    .r_pcrel = false,
+                                    .r_length = 2,
+                                    .r_extern = true,
+                                    .r_type = @enumToInt(std.macho.reloc_type_arm64.ARM64_RELOC_GOT_LOAD_PAGEOFF12),
                                 });
                             } else {
                                 return self.fail("TODO implement genSetReg for PIE GOT indirection on this platform", .{});
@@ -4788,10 +4809,14 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                                 const decl = macho_file.active_decl.?;
                                 // Load reloc for LEA instruction.
                                 try decl.link.macho.relocs.append(self.bin_file.allocator, .{
-                                    .offset = offset - 4,
-                                    .where = .local,
-                                    .where_index = @intCast(u32, x),
-                                    .payload = .{ .load = .{ .kind = .got } },
+                                    .r_offset = offset - 4,
+                                    .r_addend = 0,
+                                    .r_symbolnum = @intCast(u32, x),
+                                    .r_zig_symtab_hint = .local,
+                                    .r_pcrel = true,
+                                    .r_length = 2,
+                                    .r_extern = true,
+                                    .r_type = @enumToInt(std.macho.reloc_type_x86_64.X86_64_RELOC_GOT_LOAD),
                                 });
                             } else {
                                 return self.fail("TODO implement genSetReg for PIE GOT indirection on this platform", .{});

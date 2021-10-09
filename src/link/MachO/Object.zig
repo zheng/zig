@@ -60,11 +60,6 @@ start_atoms: std.AutoHashMapUnmanaged(MachO.MatchingSection, *Atom) = .{},
 end_atoms: std.AutoHashMapUnmanaged(MachO.MatchingSection, *Atom) = .{},
 sections_as_symbols: std.AutoHashMapUnmanaged(u16, u32) = .{},
 
-// TODO symbol mapping and its inverse can probably be simple arrays
-// instead of hash maps.
-symbol_mapping: std.AutoHashMapUnmanaged(u32, u32) = .{},
-reverse_symbol_mapping: std.AutoHashMapUnmanaged(u32, u32) = .{},
-
 analyzed: bool = false,
 
 const DebugInfo = struct {
@@ -140,8 +135,6 @@ pub fn deinit(self: *Object, allocator: *Allocator) void {
     self.symtab.deinit(allocator);
     self.strtab.deinit(allocator);
     self.sections_as_symbols.deinit(allocator);
-    self.symbol_mapping.deinit(allocator);
-    self.reverse_symbol_mapping.deinit(allocator);
     allocator.free(self.name);
 
     self.contained_atoms.deinit(allocator);
@@ -376,7 +369,7 @@ fn filterDice(dices: []macho.data_in_code_entry, start_addr: u64, end_addr: u64)
     return dices[start..end];
 }
 
-pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, macho_file: *MachO) !void {
+pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, object_id: u16, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
 
@@ -436,12 +429,6 @@ pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, macho_file: *MachO) 
         defer allocator.free(code);
         _ = try self.file.preadAll(code, sect.offset);
 
-        // Read section's list of relocations
-        var raw_relocs = try allocator.alloc(u8, sect.nreloc * @sizeOf(macho.relocation_info));
-        defer allocator.free(raw_relocs);
-        _ = try self.file.preadAll(raw_relocs, sect.reloff);
-        const relocs = mem.bytesAsSlice(macho.relocation_info, raw_relocs);
-
         // Symbols within this section only.
         const filtered_nlists = NlistWithIndex.filterInSection(sorted_nlists, sect);
 
@@ -459,8 +446,8 @@ pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, macho_file: *MachO) 
         // a temp one, unless we already did that when working out the relocations
         // of other atoms.
         const atom_local_sym_index = self.sections_as_symbols.get(sect_id) orelse blk: {
-            const atom_local_sym_index = @intCast(u32, macho_file.locals.items.len);
-            try macho_file.locals.append(allocator, .{
+            const atom_local_sym_index = @intCast(u32, self.symtab.items.len);
+            try self.symtab.append(allocator, .{
                 .n_strx = 0,
                 .n_type = macho.N_SECT,
                 .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1),
@@ -470,7 +457,7 @@ pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, macho_file: *MachO) 
             try self.sections_as_symbols.putNoClobber(allocator, sect_id, atom_local_sym_index);
             break :blk atom_local_sym_index;
         };
-        const atom = try macho_file.createEmptyAtom(atom_local_sym_index, sect.size, sect.@"align");
+        const atom = try macho_file.createEmptyAtom(atom_local_sym_index, object_id, sect.size, sect.@"align");
 
         const is_zerofill = blk: {
             const section_type = commands.sectionType(sect);
@@ -480,13 +467,119 @@ pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, macho_file: *MachO) 
             mem.copy(u8, atom.code.items, code);
         }
 
-        try atom.parseRelocs(relocs, .{
-            .base_addr = sect.addr,
-            .base_offset = 0,
-            .allocator = allocator,
-            .object = self,
-            .macho_file = macho_file,
-        });
+        // Read section's list of relocations
+        var raw_relocs = try allocator.alloc(u8, sect.nreloc * @sizeOf(macho.relocation_info));
+        defer allocator.free(raw_relocs);
+        _ = try self.file.preadAll(raw_relocs, sect.reloff);
+        const relocs = mem.bytesAsSlice(macho.relocation_info, raw_relocs);
+        try atom.relocs.ensureTotalCapacity(allocator, relocs.len);
+
+        var r_addend: i64 = 0;
+        for (relocs) |rel, i| {
+            if (macho_file.base.options.target.cpu.arch == .aarch64 and
+                @intToEnum(macho.reloc_type_arm64, rel.r_type) == .ARM64_RELOC_ADDEND)
+            {
+                r_addend = rel.r_symbolnum;
+                // Verify ADDEND is followed by a PAGE21 or PAGEOFF12.
+                if (relocs.len <= i + 1) {
+                    log.err("no relocation after ARM64_RELOC_ADDEND", .{});
+                    return error.UnexpectedRelocationType;
+                }
+                const next = @intToEnum(macho.reloc_type_arm64, relocs[i + 1].r_type);
+                switch (next) {
+                    .ARM64_RELOC_PAGE21, .ARM64_RELOC_PAGEOFF12 => {},
+                    else => {
+                        log.err("unexpected relocation type after ARM64_RELOC_ADDEND", .{});
+                        log.err("  expected ARM64_RELOC_PAGE21 or ARM64_RELOC_PAGEOFF12", .{});
+                        log.err("  found {s}", .{next});
+                        return error.UnexpectedRelocationType;
+                    },
+                }
+                continue;
+            }
+            const r_symbolnum = if (rel.r_extern == 0) outer: {
+                const r_sect_id = @intCast(u16, rel.r_symbolnum - 1);
+                const sym_index = self.sections_as_symbols.get(r_sect_id) orelse inner: {
+                    const r_sect = seg.sections.items[r_sect_id];
+                    const r_match = (try macho_file.getMatchingSection(r_sect)) orelse unreachable;
+                    const sym_index = @intCast(u32, self.symtab.items.len);
+                    try self.symtab.append(allocator, .{
+                        .n_strx = 0,
+                        .n_type = macho.N_SECT,
+                        .n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(r_match).? + 1),
+                        .n_desc = 0,
+                        .n_value = 0,
+                    });
+                    try self.sections_as_symbols.putNoClobber(allocator, r_sect_id, sym_index);
+                    break :inner sym_index;
+                };
+                break :outer sym_index;
+            } else rel.r_symbolnum;
+            const r_offset = @intCast(u32, rel.r_address);
+
+            switch (macho_file.base.options.target.cpu.arch) {
+                .aarch64 => {
+                    const r_type = @intToEnum(macho.reloc_type_arm64, rel.r_type);
+                    switch (r_type) {
+                        .ARM64_RELOC_UNSIGNED => {
+                            switch (rel.r_length) {
+                                3 => r_addend = mem.readIntLittle(i64, code[r_offset..][0..8]),
+                                2 => r_addend = mem.readIntLittle(i32, code[r_offset..][0..4]),
+                                else => unreachable,
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                .x86_64 => {
+                    const r_type = @intToEnum(macho.reloc_type_x86_64, rel.r_type);
+                    switch (r_type) {
+                        .X86_64_RELOC_UNSIGNED => {
+                            switch (rel.r_length) {
+                                3 => r_addend = mem.readIntLittle(i64, code[r_offset..][0..8]),
+                                2 => r_addend = mem.readIntLittle(i32, code[r_offset..][0..4]),
+                                else => unreachable,
+                            }
+                        },
+                        .X86_64_RELOC_SIGNED,
+                        .X86_64_RELOC_SIGNED_1,
+                        .X86_64_RELOC_SIGNED_2,
+                        .X86_64_RELOC_SIGNED_4,
+                        => {
+                            const correction: u3 = switch (r_type) {
+                                .X86_64_RELOC_SIGNED => 0,
+                                .X86_64_RELOC_SIGNED_1 => 1,
+                                .X86_64_RELOC_SIGNED_2 => 2,
+                                .X86_64_RELOC_SIGNED_4 => 4,
+                                else => unreachable,
+                            };
+                            r_addend = mem.readIntLittle(i32, code[r_offset..][0..4]) + correction;
+                            if (rel.r_extern == 0) {
+                                const target_sect_base_addr = seg.sections.items[rel.r_symbolnum - 1].addr;
+                                r_addend += @intCast(i64, sect.addr + r_offset + correction + 4) - @intCast(i64, target_sect_base_addr);
+                            }
+                        },
+                        .X86_64_RELOC_GOT => {
+                            r_addend = mem.readIntLittle(i32, code[r_offset..][0..4]);
+                        },
+                        else => {},
+                    }
+                },
+                else => unreachable,
+            }
+
+            // TODO optimize out some GOT indirections if possible.
+            atom.relocs.appendAssumeCapacity(.{
+                .r_offset = r_offset,
+                .r_addend = r_addend,
+                .r_symbolnum = r_symbolnum,
+                .r_zig_symtab_hint = null,
+                .r_pcrel = rel.r_pcrel == 1,
+                .r_length = rel.r_length,
+                .r_extern = true,
+                .r_type = rel.r_type,
+            });
+        }
 
         if (macho_file.has_dices) {
             const dices = filterDice(self.data_in_code_entries.items, sect.addr, sect.addr + sect.size);
@@ -510,8 +603,8 @@ pub fn parseIntoAtoms(self: *Object, allocator: *Allocator, macho_file: *MachO) 
 
         for (filtered_nlists) |nlist_with_index| {
             const nlist = nlist_with_index.nlist;
-            const local_sym_index = self.symbol_mapping.get(nlist_with_index.index) orelse unreachable;
-            const local = &macho_file.locals.items[local_sym_index];
+            const local_sym_index = nlist_with_index.index;
+            const local = &self.symtab.items[local_sym_index];
             local.n_sect = @intCast(u8, macho_file.section_ordinals.getIndex(match).? + 1);
 
             const stab: ?Atom.Stab = if (self.debug_info) |di| blk: {
