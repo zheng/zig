@@ -3198,9 +3198,6 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     try self.code.append(0xc3); // ret
                 },
                 .x86_64 => {
-                    // TODO when implementing defer, this will need to jump to the appropriate defer expression.
-                    // TODO optimization opportunity: figure out when we can emit this as a 2 byte instruction
-                    // which is available if the jump is 127 bytes or less forward.
                     try self.code.resize(self.code.items.len + 5);
                     self.code.items[self.code.items.len - 5] = 0xe9; // jmp rel32
                     try self.exitlude_jump_relocs.append(self.gpa, self.code.items.len - 4);

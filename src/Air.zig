@@ -3,6 +3,12 @@
 //! Unlike ZIR where there is one instance for an entire source file, each function
 //! gets its own `Air` instance.
 
+instructions: std.MultiArrayList(Inst).Slice,
+/// The meaning of this data is determined by `Inst.Tag` value.
+/// The first few indexes are reserved. See `ExtraIndex` for the values.
+extra: []const u32,
+values: []const Value,
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Value = @import("value.zig").Value;
@@ -10,12 +16,6 @@ const Type = @import("type.zig").Type;
 const Module = @import("Module.zig");
 const assert = std.debug.assert;
 const Air = @This();
-
-instructions: std.MultiArrayList(Inst).Slice,
-/// The meaning of this data is determined by `Inst.Tag` value.
-/// The first few indexes are reserved. See `ExtraIndex` for the values.
-extra: []const u32,
-values: []const Value,
 
 pub const ExtraIndex = enum(u32) {
     /// Payload index of the main `Block` in the `extra` array.
