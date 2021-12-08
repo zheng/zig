@@ -45,6 +45,10 @@ pub fn build(b: *Builder) !void {
     test_stage2.addPackagePath("test_cases", "test/cases.zig");
     test_stage2.single_threaded = single_threaded;
 
+    var test_link = b.addTest("test/src/link.zig");
+    test_link.setBuildMode(mode);
+    test_link.addPackagePath("test_cases", "test/link.zig");
+
     const fmt_build_zig = b.addFmt(&[_][]const u8{"build.zig"});
 
     const skip_debug = b.option(bool, "skip-debug", "Main test suite skips debug builds") orelse false;
@@ -57,6 +61,7 @@ pub fn build(b: *Builder) !void {
     const skip_compile_errors = b.option(bool, "skip-compile-errors", "Main test suite skips compile error tests") orelse false;
     const skip_run_translated_c = b.option(bool, "skip-run-translated-c", "Main test suite skips run-translated-c tests") orelse false;
     const skip_stage2_tests = b.option(bool, "skip-stage2-tests", "Main test suite skips self-hosted compiler tests") orelse false;
+    const skip_link_tests = b.option(bool, "skip-link-tests", "Main test suite skips self-hosted linker tests") orelse false;
     const skip_install_lib_files = b.option(bool, "skip-install-lib-files", "Do not copy lib/ files to installation prefix") orelse false;
 
     const only_install_lib_files = b.option(bool, "lib-files-only", "Only install library files") orelse false;
@@ -324,6 +329,21 @@ pub fn build(b: *Builder) !void {
     test_stage2_step.dependOn(&test_stage2.step);
     if (!skip_stage2_tests) {
         toolchain_step.dependOn(test_stage2_step);
+    }
+
+    const test_link_options = b.addOptions();
+    test_link.addOptions("build_options", test_link_options);
+    test_link_options.addOption(bool, "enable_qemu", b.enable_qemu);
+    test_link_options.addOption(bool, "enable_wine", b.enable_wine);
+    test_link_options.addOption(bool, "enable_wasmtime", b.enable_wasmtime);
+    test_link_options.addOption(bool, "enable_rosetta", b.enable_rosetta);
+    test_link_options.addOption(bool, "enable_darling", b.enable_darling);
+    test_link_options.addOption(?[]const u8, "glibc_runtimes_dir", b.glibc_runtimes_dir);
+
+    const test_link_step = b.step("test-link", "Run the self-hosted linker tests");
+    test_link_step.dependOn(&test_link.step);
+    if (!skip_link_tests) {
+        toolchain_step.dependOn(test_link_step);
     }
 
     var chosen_modes: [4]builtin.Mode = undefined;
