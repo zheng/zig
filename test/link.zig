@@ -59,25 +59,25 @@ pub fn addCases(ctx: *TestContext) !void {
             case.expectStdOut("Hello world");
         }
 
-        // {
-        //     const case = try ctx.createCase("tls", target);
-        //     const dylib = try case.createShared("a");
-        //     try dylib.addCSource("a.c",
-        //         \\_Thread_local int a;
-        //     , &.{});
-        //     const exe = try case.createExe("main");
-        //     try exe.addCSource("b.c",
-        //         \\#include <stdio.h>
-        //         \\
-        //         \\extern _Thread_local int a;
-        //         \\
-        //         \\int main() {
-        //         \\  printf("%d", a);
-        //         \\}
-        //     , &.{});
-        //     try exe.linkShared(dylib);
-        //     case.expectStdOut("0");
-        // }
+        {
+            const case = try ctx.createCase("tls", target);
+            const dylib = try case.createShared("a");
+            try dylib.addCSource("a.c",
+                \\_Thread_local int a;
+            , &.{});
+            const exe = try case.createExe("main");
+            try exe.addCSource("b.c",
+                \\#include <stdio.h>
+                \\
+                \\extern _Thread_local int a;
+                \\
+                \\int main() {
+                \\  printf("%d", a);
+                \\}
+            , &.{});
+            try exe.linkShared(dylib);
+            case.expectStdOut("0");
+        }
 
         {
             const case = try ctx.createCase("tls between in Zig and C", target);

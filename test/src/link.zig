@@ -234,7 +234,7 @@ pub const TestContext = struct {
         const arena = arena_allocator.allocator();
 
         var tmp = tmpDir(.{});
-        // defer tmp.cleanup();
+        defer tmp.cleanup();
 
         var cache_dir = try tmp.dir.makeOpenPath("zig-cache", .{});
         defer cache_dir.close();
