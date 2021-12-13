@@ -37,6 +37,16 @@ pub const TestContext = struct {
         basename: []const u8,
     };
 
+    pub const CSource = struct {
+        file: File,
+        flags: []const []const u8,
+    };
+
+    pub const ExpectedOut = struct {
+        stdout: []const u8 = &[0]u8{},
+        stderr: []const u8 = &[0]u8{},
+    };
+
     pub const InspectQuery = union(enum) {
         load_command: struct {
             cmd: macho.LC,
@@ -44,31 +54,29 @@ pub const TestContext = struct {
         },
     };
 
-    pub const Case = struct {
-        name: []const u8,
-        target: CrossTarget,
+    pub const Artifact = struct {
+        tag: Tag,
+        basename: []const u8,
         zig_source: ?File = null,
         c_sources: std.ArrayList(CSource),
         queries: std.ArrayList(InspectQuery),
-        link_flags: []const []const u8 = &[0][]u8{},
-        expected_out: ExpectedOut = .{},
+        link_objects: std.ArrayList(*const Artifact),
+        link_flags: std.ArrayList([]const u8),
 
-        const ExpectedOut = struct {
-            stdout: []const u8 = &[0]u8{},
-            stderr: []const u8 = &[0]u8{},
+        const Tag = enum {
+            exe,
+            shared,
+            archive,
         };
 
-        const CSource = struct {
-            file: File,
-            flags: []const []const u8,
-        };
-
-        pub fn deinit(self: *Case) void {
+        pub fn deinit(self: *Artifact) void {
             self.c_sources.deinit();
             self.queries.deinit();
+            self.link_objects.deinit();
+            self.link_flags.deinit();
         }
 
-        pub fn addZigSource(self: *Case, basename: []const u8, bytes: []const u8) void {
+        pub fn addZigSource(self: *Artifact, basename: []const u8, bytes: []const u8) void {
             assert(self.zig_source == null);
             self.zig_source = .{
                 .basename = basename,
@@ -77,7 +85,7 @@ pub const TestContext = struct {
         }
 
         pub fn addCSource(
-            self: *Case,
+            self: *Artifact,
             basename: []const u8,
             bytes: []const u8,
             flags: []const []const u8,
@@ -91,8 +99,73 @@ pub const TestContext = struct {
             });
         }
 
-        pub fn setLinkFlags(self: *Case, flags: []const []const u8) void {
-            self.link_flags = flags;
+        pub fn installName(self: Artifact, allocator: Allocator, target: std.Target) error{OutOfMemory}![]const u8 {
+            return switch (self.tag) {
+                .exe => fmt.allocPrint(allocator, "{s}{s}", .{ self.basename, target.exeFileExt() }),
+                .shared => fmt.allocPrint(allocator, "{s}{s}{s}", .{
+                    target.libPrefix(),
+                    self.basename,
+                    target.dynamicLibSuffix(),
+                }),
+                .archive => fmt.allocPrint(allocator, "{s}{s}{s}", .{
+                    target.libPrefix(),
+                    self.basename,
+                    target.staticLibSuffix(),
+                }),
+            };
+        }
+
+        pub fn addLinkFlags(self: *Artifact, flags: []const []const u8) !void {
+            try self.link_flags.appendSlice(flags);
+        }
+
+        pub fn addQuery(self: *Artifact, query: InspectQuery) !void {
+            try self.queries.append(query);
+        }
+
+        pub fn linkArchive(self: *Artifact, archive: *const Artifact) !void {
+            try self.link_objects.append(archive);
+        }
+
+        pub fn linkShared(self: *Artifact, shared: *const Artifact) !void {
+            try self.link_objects.append(shared);
+            try self.link_flags.append("-rpath");
+            try self.link_flags.append(".");
+        }
+    };
+
+    pub const Case = struct {
+        name: []const u8,
+        target: CrossTarget,
+        artifacts: std.ArrayList(Artifact),
+        expected_out: ExpectedOut = .{},
+
+        pub fn deinit(self: *Case) void {
+            for (self.artifacts.items) |*artifact| {
+                artifact.deinit();
+            }
+            self.artifacts.deinit();
+        }
+
+        pub fn createExe(self: *Case, basename: []const u8) !*Artifact {
+            return self.createArtifact(basename, .exe);
+        }
+
+        pub fn createShared(self: *Case, basename: []const u8) !*Artifact {
+            return self.createArtifact(basename, .shared);
+        }
+
+        fn createArtifact(self: *Case, basename: []const u8, tag: Artifact.Tag) !*Artifact {
+            const index = self.artifacts.items.len;
+            try self.artifacts.append(Artifact{
+                .tag = tag,
+                .basename = basename,
+                .c_sources = std.ArrayList(CSource).init(testing.allocator),
+                .queries = std.ArrayList(InspectQuery).init(testing.allocator),
+                .link_objects = std.ArrayList(*const Artifact).init(testing.allocator),
+                .link_flags = std.ArrayList([]const u8).init(testing.allocator),
+            });
+            return &self.artifacts.items[index];
         }
 
         pub fn expectStdOut(self: *Case, stdout: []const u8) void {
@@ -101,10 +174,6 @@ pub const TestContext = struct {
 
         pub fn expectStdErr(self: *Case, stderr: []const u8) void {
             self.expected_out.stderr = stderr;
-        }
-
-        pub fn expectInBinary(self: *Case, query: InspectQuery) !void {
-            try self.queries.append(query);
         }
     };
 
@@ -125,8 +194,7 @@ pub const TestContext = struct {
         try self.cases.append(Case{
             .name = name,
             .target = target,
-            .c_sources = std.ArrayList(Case.CSource).init(testing.allocator),
-            .queries = std.ArrayList(InspectQuery).init(testing.allocator),
+            .artifacts = std.ArrayList(Artifact).init(testing.allocator),
         });
         return &self.cases.items[index];
     }
@@ -158,16 +226,12 @@ pub const TestContext = struct {
     }
 
     fn runOneCase(allocator: Allocator, case: Case, host: std.zig.system.NativeTargetInfo) !void {
-        _ = host;
         const target_info = try std.zig.system.NativeTargetInfo.detect(allocator, case.target);
         const target = target_info.target;
 
         var arena_allocator = std.heap.ArenaAllocator.init(allocator);
         defer arena_allocator.deinit();
         const arena = arena_allocator.allocator();
-
-        const target_triple = try target.zigTriple(arena);
-        _ = target_triple;
 
         var tmp = tmpDir(.{});
         // defer tmp.cleanup();
@@ -180,19 +244,140 @@ pub const TestContext = struct {
             &[_][]const u8{ ".", "zig-cache", "tmp", &tmp.sub_path },
         );
 
+        var exe_artifact: ?Artifact = null;
+        for (case.artifacts.items) |artifact| {
+            try buildArtifact(arena, artifact, target, tmp.dir, cwd);
+            try inspectArtifact(arena, artifact, tmp.dir, target);
+
+            if (artifact.tag == .exe) {
+                if (exe_artifact) |exe| {
+                    print("\nMultiple exe artifacts defined: {s} and {s}\n", .{
+                        exe.basename,
+                        artifact.basename,
+                    });
+                    return error.MultipleExeArtifacts;
+                }
+                exe_artifact = artifact;
+            }
+        }
+
+        if (exe_artifact) |exe| {
+            const exe_path = try fs.path.join(arena, &.{ ".", exe.basename });
+            var run_argv = std.ArrayList([]const u8).init(arena);
+            switch (host.getExternalExecutor(target_info, .{})) {
+                .native => {},
+                .rosetta => if (!enable_rosetta) return,
+                .qemu => |bin_name| if (enable_qemu) {
+                    const need_cross_glibc = case.target.isGnuLibC();
+                    const glibc_dir_arg = if (need_cross_glibc)
+                        glibc_runtimes_dir
+                    else
+                        null;
+
+                    try run_argv.append(bin_name);
+                    if (glibc_dir_arg) |dir| {
+                        // TODO look into making this a call to `linuxTriple`. This
+                        // needs the directory to be called "i686" rather than
+                        // "i386" which is why we do it manually here.
+                        const fmt_str = "{s}" ++ fs.path.sep_str ++ "{s}-{s}-{s}";
+                        const cpu_arch = case.target.getCpuArch();
+                        const os_tag = case.target.getOsTag();
+                        const abi = case.target.getAbi();
+                        const cpu_arch_name: []const u8 = if (cpu_arch == .i386)
+                            "i686"
+                        else
+                            @tagName(cpu_arch);
+                        const full_dir = try fmt.allocPrint(arena, fmt_str, .{
+                            dir, cpu_arch_name, @tagName(os_tag), @tagName(abi),
+                        });
+
+                        try run_argv.append("-L");
+                        try run_argv.append(full_dir);
+                    }
+                } else {
+                    return;
+                },
+                .darling => |bin_name| if (enable_darling) {
+                    try run_argv.append(bin_name);
+                    try run_argv.append("shell");
+                } else {
+                    return;
+                },
+                .wasmtime => |bin_name| if (enable_wasmtime) {
+                    try run_argv.append(bin_name);
+                    try run_argv.append("--dir=.");
+                } else {
+                    return;
+                },
+                .wine => |bin_name| if (enable_wine) {
+                    try run_argv.append(bin_name);
+                } else {
+                    return;
+                },
+                else => return,
+            }
+            try run_argv.append(exe_path);
+
+            const exec_result = std.ChildProcess.exec(.{
+                .allocator = arena,
+                .argv = run_argv.items,
+                .cwd_dir = tmp.dir,
+                .cwd = cwd,
+            }) catch |err| {
+                print("\nThe following command failed with {s}:\n", .{@errorName(err)});
+                dumpArgs(run_argv.items);
+                return error.ChildProcessExecution;
+            };
+            switch (exec_result.term) {
+                .Exited => |code| {
+                    if (code != 0) {
+                        print("\n{s}\n{s}: execution exited with code {d}:\n", .{
+                            exec_result.stderr, case.name, code,
+                        });
+                        dumpArgs(run_argv.items);
+                        return error.ChildProcessExecution;
+                    }
+                },
+                else => {
+                    print("\n{s}\n{s}: execution crashed:\n", .{
+                        exec_result.stderr, case.name,
+                    });
+                    dumpArgs(run_argv.items);
+                    return error.ChildProcessExecution;
+                },
+            }
+            try testing.expectEqualStrings(case.expected_out.stdout, exec_result.stdout);
+            try testing.expectEqualStrings(case.expected_out.stderr, exec_result.stderr);
+        }
+    }
+
+    fn buildArtifact(
+        arena: Allocator,
+        artifact: Artifact,
+        target: std.Target,
+        cwd_dir: fs.Dir,
+        cwd: []const u8,
+    ) !void {
         var zig_args = std.ArrayList([]const u8).init(arena);
         try zig_args.append(testing.zig_exe_path);
 
-        try zig_args.append("build-exe");
+        switch (artifact.tag) {
+            .exe => try zig_args.append("build-exe"),
+            .shared => {
+                try zig_args.append("build-lib");
+                try zig_args.append("-dynamic");
+            },
+            .archive => try zig_args.append("build-lib"),
+        }
 
-        if (case.zig_source) |zig_source| {
-            try tmp.dir.writeFile(zig_source.basename, zig_source.bytes);
+        if (artifact.zig_source) |zig_source| {
+            try cwd_dir.writeFile(zig_source.basename, zig_source.bytes);
             try zig_args.append(zig_source.basename);
         }
 
-        if (case.c_sources.items.len > 0) {
-            for (case.c_sources.items) |source| {
-                try tmp.dir.writeFile(source.file.basename, source.file.bytes);
+        if (artifact.c_sources.items.len > 0) {
+            for (artifact.c_sources.items) |source| {
+                try cwd_dir.writeFile(source.file.basename, source.file.bytes);
                 try zig_args.append("-cflags");
                 try zig_args.appendSlice(source.flags);
                 try zig_args.append("--");
@@ -201,19 +386,26 @@ pub const TestContext = struct {
         }
 
         try zig_args.append("--name");
-        try zig_args.append("test");
+        try zig_args.append(artifact.basename);
 
+        const target_triple = try target.zigTriple(arena);
         try zig_args.append("-target");
         try zig_args.append(target_triple);
 
-        try zig_args.appendSlice(case.link_flags);
+        try zig_args.ensureUnusedCapacity(artifact.link_objects.items.len);
+        for (artifact.link_objects.items) |other| {
+            const install_name = try other.installName(arena, target);
+            zig_args.appendAssumeCapacity(install_name);
+        }
+
+        try zig_args.appendSlice(artifact.link_flags.items);
 
         // dumpArgs(zig_args.items);
 
         const result = try std.ChildProcess.exec(.{
             .allocator = arena,
             .argv = zig_args.items,
-            .cwd_dir = tmp.dir,
+            .cwd_dir = cwd_dir,
             .cwd = cwd,
         });
         if (result.stdout.len != 0) {
@@ -227,107 +419,11 @@ pub const TestContext = struct {
             dumpArgs(zig_args.items);
             return error.CompileError;
         }
-
-        const exe_path = try fs.path.join(arena, &.{ cwd, "test" });
-        try inspectBinary(arena, case, exe_path);
-
-        var run_argv = std.ArrayList([]const u8).init(arena);
-        switch (host.getExternalExecutor(target_info, .{})) {
-            .native => {
-                try run_argv.append("./test");
-            },
-            .rosetta => if (enable_rosetta) {
-                try run_argv.append("./test");
-            } else {
-                return;
-            },
-            .qemu => |bin_name| if (enable_qemu) {
-                const need_cross_glibc = case.target.isGnuLibC() and case.c_sources.items.len > 0;
-                const glibc_dir_arg = if (need_cross_glibc)
-                    glibc_runtimes_dir
-                else
-                    null;
-
-                try run_argv.append(bin_name);
-                if (glibc_dir_arg) |dir| {
-                    // TODO look into making this a call to `linuxTriple`. This
-                    // needs the directory to be called "i686" rather than
-                    // "i386" which is why we do it manually here.
-                    const fmt_str = "{s}" ++ fs.path.sep_str ++ "{s}-{s}-{s}";
-                    const cpu_arch = case.target.getCpuArch();
-                    const os_tag = case.target.getOsTag();
-                    const abi = case.target.getAbi();
-                    const cpu_arch_name: []const u8 = if (cpu_arch == .i386)
-                        "i686"
-                    else
-                        @tagName(cpu_arch);
-                    const full_dir = try fmt.allocPrint(arena, fmt_str, .{
-                        dir, cpu_arch_name, @tagName(os_tag), @tagName(abi),
-                    });
-
-                    try run_argv.append("-L");
-                    try run_argv.append(full_dir);
-                }
-            } else {
-                return;
-            },
-            .darling => |bin_name| if (enable_darling) {
-                try run_argv.append(bin_name);
-                try run_argv.append("shell");
-                try run_argv.append("./test");
-            } else {
-                return;
-            },
-            .wasmtime => |bin_name| if (enable_wasmtime) {
-                try run_argv.append(bin_name);
-                try run_argv.append("--dir=.");
-                try run_argv.append("./test");
-            } else {
-                return;
-            },
-            .wine => |bin_name| if (enable_wine) {
-                try run_argv.append(bin_name);
-                try run_argv.append("./test");
-            } else {
-                return;
-            },
-            else => return,
-        }
-
-        const exec_result = std.ChildProcess.exec(.{
-            .allocator = arena,
-            .argv = run_argv.items,
-            .cwd_dir = tmp.dir,
-            .cwd = cwd,
-        }) catch |err| {
-            print("\nThe following command failed with {s}:\n", .{@errorName(err)});
-            dumpArgs(run_argv.items);
-            return error.ChildProcessExecution;
-        };
-        switch (exec_result.term) {
-            .Exited => |code| {
-                if (code != 0) {
-                    print("\n{s}\n{s}: execution exited with code {d}:\n", .{
-                        exec_result.stderr, case.name, code,
-                    });
-                    dumpArgs(run_argv.items);
-                    return error.ChildProcessExecution;
-                }
-            },
-            else => {
-                print("\n{s}\n{s}: execution crashed:\n", .{
-                    exec_result.stderr, case.name,
-                });
-                dumpArgs(run_argv.items);
-                return error.ChildProcessExecution;
-            },
-        }
-        try testing.expectEqualStrings(case.expected_out.stdout, exec_result.stdout);
-        try testing.expectEqualStrings(case.expected_out.stderr, exec_result.stderr);
     }
 
-    fn inspectBinary(arena: Allocator, case: Case, exe_path: []const u8) !void {
-        const file = try fs.cwd().openFile(exe_path, .{});
+    fn inspectArtifact(arena: Allocator, artifact: Artifact, cwd_dir: fs.Dir, target: std.Target) !void {
+        const install_name = try artifact.installName(arena, target);
+        const file = try cwd_dir.openFile(install_name, .{});
         defer file.close();
 
         // TODO mmap the file, but remember to handle Windows as the host too.
@@ -347,7 +443,7 @@ pub const TestContext = struct {
 
         var lc_dump_cache = std.AutoHashMap(u16, []const u8).init(arena);
 
-        for (case.queries.items) |query| {
+        for (artifact.queries.items) |query| {
             switch (query) {
                 .load_command => |lc| {
                     for (load_commands.items) |given_lc, i| {

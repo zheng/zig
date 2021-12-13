@@ -20,8 +20,9 @@ const all_targets = &[_]CrossTarget{
 pub fn addCases(ctx: *TestContext) !void {
     for (all_targets) |target| {
         {
-            var case = try ctx.createCase("hello world in C", target);
-            try case.addCSource("test.c",
+            const case = try ctx.createCase("hello world in C", target);
+            const exe = try case.createExe("hello");
+            try exe.addCSource("main.c",
                 \\#include <stdio.h>
                 \\
                 \\int main(int argc, char* argv[]) {
@@ -33,8 +34,55 @@ pub fn addCases(ctx: *TestContext) !void {
         }
 
         {
-            var case = try ctx.createCase("TLS support in Zig and C", target);
-            case.addZigSource("main.zig",
+            const case = try ctx.createCase("dylib", target);
+            const dylib = try case.createShared("a");
+            try dylib.addCSource("a.c",
+                \\#include <stdio.h>
+                \\char world[] = "world";
+                \\
+                \\char *hello() {
+                \\  return "Hello";
+                \\}
+            , &.{});
+            const exe = try case.createExe("main");
+            try exe.addCSource("main.c",
+                \\#include <stdio.h>
+                \\
+                \\char *hello();
+                \\extern char world[];
+                \\
+                \\int main() {
+                \\  printf("%s %s", hello(), world);
+                \\}
+            , &.{});
+            try exe.linkShared(dylib);
+            case.expectStdOut("Hello world");
+        }
+
+        // {
+        //     const case = try ctx.createCase("tls", target);
+        //     const dylib = try case.createShared("a");
+        //     try dylib.addCSource("a.c",
+        //         \\_Thread_local int a;
+        //     , &.{});
+        //     const exe = try case.createExe("main");
+        //     try exe.addCSource("b.c",
+        //         \\#include <stdio.h>
+        //         \\
+        //         \\extern _Thread_local int a;
+        //         \\
+        //         \\int main() {
+        //         \\  printf("%d", a);
+        //         \\}
+        //     , &.{});
+        //     try exe.linkShared(dylib);
+        //     case.expectStdOut("0");
+        // }
+
+        {
+            const case = try ctx.createCase("tls between in Zig and C", target);
+            const exe = try case.createExe("main");
+            exe.addZigSource("main.zig",
                 \\const std = @import("std");
                 \\
                 \\threadlocal var globl: usize = 0;
@@ -47,7 +95,7 @@ pub fn addCases(ctx: *TestContext) !void {
                 \\    std.debug.print("{d}, {d}\n", .{globl, other});
                 \\}
             );
-            try case.addCSource("a.c",
+            try exe.addCSource("a.c",
                 \\_Thread_local int other = 10;
             , &.{});
             case.expectStdErr(
@@ -58,22 +106,24 @@ pub fn addCases(ctx: *TestContext) !void {
         }
 
         {
-            var case = try ctx.createCase("rpaths in binary", target);
-            try case.addCSource("main.c",
+            const case = try ctx.createCase("rpaths in exe", target);
+            const exe = try case.createExe("main");
+            try exe.addCSource("main.c",
                 \\int main() {}
             , &.{});
-            case.setLinkFlags(&.{ "-rpath", "foo", "-rpath", "@bar" });
-            try case.expectInBinary(.{
+            try exe.addLinkFlags(&.{ "-rpath", "foo", "-rpath", "@bar" });
+            try exe.addQuery(.{
                 .load_command = .{ .cmd = .RPATH, .grep = "path foo" },
             });
-            try case.expectInBinary(.{
+            try exe.addQuery(.{
                 .load_command = .{ .cmd = .RPATH, .grep = "path @bar" },
             });
         }
 
         {
-            var case = try ctx.createCase("common symbols (tentative definitions)", target);
-            case.addZigSource("main.zig",
+            const case = try ctx.createCase("common symbols", target);
+            const exe = try case.createExe("main");
+            exe.addZigSource("main.zig",
                 \\const std = @import("std");
                 \\
                 \\extern fn common_defined_externally() c_int;
@@ -86,7 +136,7 @@ pub fn addCases(ctx: *TestContext) !void {
                 \\   std.debug.print("{d}\n", .{add_to_i_and_j(2)});
                 \\}
             );
-            try case.addCSource("a.c",
+            try exe.addCSource("a.c",
                 \\int i;
                 \\int j;
                 \\
@@ -94,7 +144,7 @@ pub fn addCases(ctx: *TestContext) !void {
                 \\  return x + i + j;
                 \\}
             , &.{"-fcommon"});
-            try case.addCSource("b.c",
+            try exe.addCSource("b.c",
                 \\long i;
                 \\int j = 2;
                 \\int k;
@@ -103,7 +153,7 @@ pub fn addCases(ctx: *TestContext) !void {
                 \\  i++;
                 \\}
             , &.{"-fcommon"});
-            try case.addCSource("c.c",
+            try exe.addCSource("c.c",
                 \\extern int k;
                 \\
                 \\int common_defined_externally() {
@@ -118,12 +168,13 @@ pub fn addCases(ctx: *TestContext) !void {
         }
 
         {
-            var case = try ctx.createCase("common symbols alignment", target);
-            try case.addCSource("a.c",
+            const case = try ctx.createCase("common symbols alignment", target);
+            const exe = try case.createExe("main");
+            try exe.addCSource("a.c",
                 \\int foo;
                 \\__attribute__((aligned(4096))) int bar;
             , &.{"-fcommon"});
-            try case.addCSource("b.c",
+            try exe.addCSource("b.c",
                 \\#include <stdio.h>
                 \\#include <stdint.h>
                 \\
