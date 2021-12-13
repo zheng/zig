@@ -39,8 +39,8 @@ pub const TestContext = struct {
 
     pub const InspectQuery = union(enum) {
         load_command: struct {
-            cmd: u32,
-            data: []const u8,
+            cmd: macho.LC,
+            grep: []const u8,
         },
     };
 
@@ -134,9 +134,17 @@ pub const TestContext = struct {
     fn run(self: *TestContext) !void {
         const host = try std.zig.system.NativeTargetInfo.detect(testing.allocator, .{});
 
+        var progress = std.Progress{};
+        const root_node = try progress.start("linker", self.cases.items.len);
+        defer root_node.end();
+
         var fail_count: usize = 0;
 
         for (self.cases.items) |case| {
+            var prg_node = root_node.start(case.name, 1);
+            prg_node.activate();
+            defer prg_node.end();
+
             runOneCase(testing.allocator, case, host) catch |err| {
                 fail_count += 1;
                 print("test '{s}' failed: {s}\n\n", .{ case.name, @errorName(err) });
@@ -172,25 +180,24 @@ pub const TestContext = struct {
             &[_][]const u8{ ".", "zig-cache", "tmp", &tmp.sub_path },
         );
 
-        if (case.zig_source) |zig_source| {
-            try tmp.dir.writeFile(zig_source.basename, zig_source.bytes);
-        }
-
-        for (case.c_sources.items) |source| {
-            try tmp.dir.writeFile(source.file.basename, source.file.bytes);
-        }
-
         var zig_args = std.ArrayList([]const u8).init(arena);
         try zig_args.append(testing.zig_exe_path);
 
         try zig_args.append("build-exe");
 
         if (case.zig_source) |zig_source| {
+            try tmp.dir.writeFile(zig_source.basename, zig_source.bytes);
             try zig_args.append(zig_source.basename);
         }
 
-        for (case.c_sources.items) |source| {
-            try zig_args.append(source.file.basename);
+        if (case.c_sources.items.len > 0) {
+            for (case.c_sources.items) |source| {
+                try tmp.dir.writeFile(source.file.basename, source.file.bytes);
+                try zig_args.append("-cflags");
+                try zig_args.appendSlice(source.flags);
+                try zig_args.append("--");
+                try zig_args.append(source.file.basename);
+            }
         }
 
         try zig_args.append("--name");
@@ -201,12 +208,7 @@ pub const TestContext = struct {
 
         try zig_args.appendSlice(case.link_flags);
 
-        // try zig_args.append("-cflags");
-        // for (case.c_sources.items) |source| {
-        //     try zig_args.appendSlice(source.flags);
-        // }
-
-        dumpArgs(zig_args.items);
+        // dumpArgs(zig_args.items);
 
         const result = try std.ChildProcess.exec(.{
             .allocator = arena,
@@ -226,14 +228,16 @@ pub const TestContext = struct {
             return error.CompileError;
         }
 
-        var run_argv = std.ArrayList([]const u8).init(arena);
+        const exe_path = try fs.path.join(arena, &.{ cwd, "test" });
+        try inspectBinary(arena, case, exe_path);
 
+        var run_argv = std.ArrayList([]const u8).init(arena);
         switch (host.getExternalExecutor(target_info, .{})) {
             .native => {
-                try run_argv.append("test");
+                try run_argv.append("./test");
             },
             .rosetta => if (enable_rosetta) {
-                try run_argv.append("test");
+                try run_argv.append("./test");
             } else {
                 return;
             },
@@ -270,20 +274,20 @@ pub const TestContext = struct {
             .darling => |bin_name| if (enable_darling) {
                 try run_argv.append(bin_name);
                 try run_argv.append("shell");
-                try run_argv.append("test");
+                try run_argv.append("./test");
             } else {
                 return;
             },
             .wasmtime => |bin_name| if (enable_wasmtime) {
                 try run_argv.append(bin_name);
                 try run_argv.append("--dir=.");
-                try run_argv.append("test");
+                try run_argv.append("./test");
             } else {
                 return;
             },
             .wine => |bin_name| if (enable_wine) {
                 try run_argv.append(bin_name);
-                try run_argv.append("test");
+                try run_argv.append("./test");
             } else {
                 return;
             },
@@ -321,73 +325,75 @@ pub const TestContext = struct {
         try testing.expectEqualStrings(case.expected_out.stdout, exec_result.stdout);
         try testing.expectEqualStrings(case.expected_out.stderr, exec_result.stderr);
     }
+
+    fn inspectBinary(arena: Allocator, case: Case, exe_path: []const u8) !void {
+        const file = try fs.cwd().openFile(exe_path, .{});
+        defer file.close();
+
+        // TODO mmap the file, but remember to handle Windows as the host too.
+        // The test should be possible to perform on ANY OS!
+        const reader = file.reader();
+        const header = try reader.readStruct(macho.mach_header_64);
+        assert(header.filetype == macho.MH_EXECUTE or header.filetype == macho.MH_DYLIB);
+
+        var load_commands = std.ArrayList(macho.LoadCommand).init(arena);
+        try load_commands.ensureTotalCapacity(header.ncmds);
+
+        var ncmd: u16 = 0;
+        while (ncmd < header.ncmds) : (ncmd += 1) {
+            var cmd = try macho.LoadCommand.read(arena, reader);
+            load_commands.appendAssumeCapacity(cmd);
+        }
+
+        var lc_dump_cache = std.AutoHashMap(u16, []const u8).init(arena);
+
+        for (case.queries.items) |query| {
+            switch (query) {
+                .load_command => |lc| {
+                    for (load_commands.items) |given_lc, i| {
+                        if (lc.cmd != given_lc.cmd()) continue;
+                        const lc_dump = lc_dump_cache.get(@intCast(u16, i)) orelse blk: {
+                            const lc_dump = try dumpLoadCommand(arena, given_lc);
+                            try lc_dump_cache.putNoClobber(@intCast(u16, i), lc_dump);
+                            break :blk lc_dump;
+                        };
+                        if (mem.indexOf(u8, lc_dump, lc.grep)) |_| {
+                            break;
+                        }
+                    } else {
+                        print(
+                            \\
+                            \\======== Expected to find this load command: ========
+                            \\{} with data
+                            \\  {s}
+                            \\
+                        , .{ lc.cmd, fmt.fmtSliceEscapeLower(lc.grep) });
+                        return error.TestFailed;
+                    }
+                },
+            }
+        }
+    }
 };
-
-// const MachoParseAndInspectStep = struct {
-//     pub const base_id = .custom;
-
-//     step: build.Step,
-//     builder: *build.Builder,
-//     macho_file: *build.LibExeObjStep,
-//     load_commands: ArrayList(macho.LoadCommand),
-
-//     pub fn init(builder: *build.Builder, macho_file: *build.LibExeObjStep) MachoParseAndInspectStep {
-//         return MachoParseAndInspectStep{
-//             .builder = builder,
-//             .step = build.Step.init(.custom, builder.fmt("MachoParseAndInspect {s}", .{
-//                 macho_file.getOutputSource().getDisplayName(),
-//             }), builder.allocator, make),
-//             .macho_file = macho_file,
-//             .load_commands = ArrayList(macho.LoadCommand).init(builder.allocator),
-//         };
-//     }
-
-//     pub fn addExpectedLoadCommand(self: *MachoParseAndInspectStep, lc: macho.LoadCommand) void {
-//         self.load_commands.append(lc) catch unreachable;
-//     }
-
-//     fn make(step: *build.Step) !void {
-//         const self = @fieldParentPtr(MachoParseAndInspectStep, "step", step);
-//         const executable_path = self.macho_file.installed_path orelse
-//             self.macho_file.getOutputSource().getPath(self.builder);
-
-//         const file = try fs.cwd().openFile(executable_path, .{});
-//         defer file.close();
-
-//         // TODO mmap the file, but remember to handle Windows as the host too.
-//         // The test should be possible to perform on ANY OS!
-//         const reader = file.reader();
-//         const header = try reader.readStruct(macho.mach_header_64);
-//         assert(header.filetype == macho.MH_EXECUTE or header.filetype == macho.MH_DYLIB);
-
-//         var load_commands = ArrayList(macho.LoadCommand).init(self.builder.allocator);
-//         try load_commands.ensureTotalCapacity(header.ncmds);
-
-//         var i: u16 = 0;
-//         while (i < header.ncmds) : (i += 1) {
-//             var cmd = try macho.LoadCommand.read(self.builder.allocator, reader);
-//             load_commands.appendAssumeCapacity(cmd);
-//         }
-
-//         outer: for (self.load_commands.items) |exp_lc| {
-//             for (load_commands.items) |given_lc| {
-//                 if (exp_lc.eql(given_lc)) continue :outer;
-//             }
-
-//             std.debug.print(
-//                 \\
-//                 \\======== Expected to find this load command: ========
-//                 \\{}
-//                 \\
-//             , .{exp_lc});
-//             return error.TestFailed;
-//         }
-//     }
-// };
 
 fn dumpArgs(argv: []const []const u8) void {
     for (argv) |arg| {
         print("{s} ", .{arg});
     }
     print("\n", .{});
+}
+
+fn dumpLoadCommand(allocator: Allocator, lc: macho.LoadCommand) ![]const u8 {
+    switch (lc.cmd()) {
+        .RPATH => {
+            const rpath = lc.rpath;
+            const fmt_slice = try fmt.allocPrint(allocator,
+                \\cmd LC_RPATH
+                \\cmdsize {d}
+                \\path {s}
+            , .{ lc.cmdsize(), rpath.data });
+            return fmt_slice;
+        },
+        else => return error.TODODumpMoreLoadCommands,
+    }
 }

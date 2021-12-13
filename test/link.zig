@@ -62,10 +62,59 @@ pub fn addCases(ctx: *TestContext) !void {
             try case.addCSource("main.c",
                 \\int main() {}
             , &.{});
-            case.setLinkFlags(&.{ "-rpath", "foo" });
+            case.setLinkFlags(&.{ "-rpath", "foo", "-rpath", "@bar" });
             try case.expectInBinary(.{
-                .load_command = .{ .cmd = macho.LC_RPATH, .data = "foo" },
+                .load_command = .{ .cmd = .RPATH, .grep = "path foo" },
             });
+            try case.expectInBinary(.{
+                .load_command = .{ .cmd = .RPATH, .grep = "path @bar" },
+            });
+        }
+
+        {
+            var case = try ctx.createCase("common symbols (tentative definitions)", target);
+            case.addZigSource("main.zig",
+                \\const std = @import("std");
+                \\
+                \\extern fn common_defined_externally() c_int;
+                \\extern fn incr_i() void;
+                \\extern fn add_to_i_and_j(x: c_int) c_int;
+                \\
+                \\pub fn main() void {
+                \\   std.debug.print("{d}\n", .{common_defined_externally()});
+                \\   incr_i();
+                \\   std.debug.print("{d}\n", .{add_to_i_and_j(2)});
+                \\}
+            );
+            try case.addCSource("a.c",
+                \\int i;
+                \\int j;
+                \\
+                \\int add_to_i_and_j(int x) {
+                \\  return x + i + j;
+                \\}
+            , &.{"-fcommon"});
+            try case.addCSource("b.c",
+                \\long i;
+                \\int j = 2;
+                \\int k;
+                \\
+                \\void incr_i() {
+                \\  i++;
+                \\}
+            , &.{"-fcommon"});
+            try case.addCSource("c.c",
+                \\extern int k;
+                \\
+                \\int common_defined_externally() {
+                \\  return k;
+                \\}
+            , &.{"-fcommon"});
+            case.expectStdErr(
+                \\0
+                \\5
+                \\
+            );
         }
     }
 }
