@@ -116,5 +116,25 @@ pub fn addCases(ctx: *TestContext) !void {
                 \\
             );
         }
+
+        {
+            var case = try ctx.createCase("common symbols alignment", target);
+            try case.addCSource("a.c",
+                \\int foo;
+                \\__attribute__((aligned(4096))) int bar;
+            , &.{"-fcommon"});
+            try case.addCSource("b.c",
+                \\#include <stdio.h>
+                \\#include <stdint.h>
+                \\
+                \\extern int foo;
+                \\extern int bar;
+                \\
+                \\int main() {
+                \\  printf("%lu %lu", (uintptr_t)&foo % 4, (uintptr_t)&bar % 4096);
+                \\}
+            , &.{});
+            case.expectStdOut("0 0");
+        }
     }
 }
