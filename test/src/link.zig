@@ -43,8 +43,8 @@ pub const TestContext = struct {
     };
 
     pub const ExpectedOut = struct {
-        stdout: []const u8 = &[0]u8{},
-        stderr: []const u8 = &[0]u8{},
+        bytes: []const u8,
+        tag: enum { exact, fuzzy } = .exact,
     };
 
     pub const InspectQuery = union(enum) {
@@ -62,6 +62,7 @@ pub const TestContext = struct {
         queries: std.ArrayList(InspectQuery),
         link_objects: std.ArrayList(*const Artifact),
         link_flags: std.ArrayList([]const u8),
+        expected_error: ?ExpectedOut = null,
 
         const Tag = enum {
             exe,
@@ -132,13 +133,22 @@ pub const TestContext = struct {
             try self.link_flags.append("-rpath");
             try self.link_flags.append(".");
         }
+
+        pub fn expectError(self: *Artifact, bytes: []const u8) void {
+            self.expected_error = .{ .bytes = bytes };
+        }
+
+        pub fn expectErrorFuzzy(self: *Artifact, bytes: []const u8) void {
+            self.expected_error = .{ .bytes = bytes, .tag = .fuzzy };
+        }
     };
 
     pub const Case = struct {
         name: []const u8,
         target: CrossTarget,
         artifacts: std.ArrayList(Artifact),
-        expected_out: ExpectedOut = .{},
+        expected_stdout: ?ExpectedOut = null,
+        expected_stderr: ?ExpectedOut = null,
 
         pub fn deinit(self: *Case) void {
             for (self.artifacts.items) |*artifact| {
@@ -169,11 +179,25 @@ pub const TestContext = struct {
         }
 
         pub fn expectStdOut(self: *Case, stdout: []const u8) void {
-            self.expected_out.stdout = stdout;
+            self.expected_stdout = .{ .bytes = stdout };
+        }
+
+        pub fn expectStdOutFuzzy(self: *Case, stdout: []const u8) void {
+            self.expected_stdout = .{
+                .bytes = stdout,
+                .tag = .fuzzy,
+            };
         }
 
         pub fn expectStdErr(self: *Case, stderr: []const u8) void {
-            self.expected_out.stderr = stderr;
+            self.expected_stderr = .{ .bytes = stderr };
+        }
+
+        pub fn expectStdErrFuzzy(self: *Case, stderr: []const u8) void {
+            self.expected_stderr = .{
+                .bytes = stderr,
+                .tag = .fuzzy,
+            };
         }
     };
 
@@ -246,7 +270,9 @@ pub const TestContext = struct {
 
         var exe_artifact: ?Artifact = null;
         for (case.artifacts.items) |artifact| {
-            try buildArtifact(arena, artifact, target, tmp.dir, cwd);
+            const is_built = try buildArtifact(arena, artifact, target, tmp.dir, cwd);
+            if (!is_built) return;
+
             try inspectArtifact(arena, artifact, tmp.dir, target);
 
             if (artifact.tag == .exe) {
@@ -346,8 +372,19 @@ pub const TestContext = struct {
                     return error.ChildProcessExecution;
                 },
             }
-            try testing.expectEqualStrings(case.expected_out.stdout, exec_result.stdout);
-            try testing.expectEqualStrings(case.expected_out.stderr, exec_result.stderr);
+
+            if (case.expected_stdout) |stdout| {
+                switch (stdout.tag) {
+                    .exact => try testing.expectEqualStrings(stdout.bytes, exec_result.stdout),
+                    .fuzzy => try testing.expect(mem.indexOf(u8, exec_result.stdout, stdout.bytes) != null),
+                }
+            }
+            if (case.expected_stderr) |stderr| {
+                switch (stderr.tag) {
+                    .exact => try testing.expectEqualStrings(stderr.bytes, exec_result.stderr),
+                    .fuzzy => try testing.expect(mem.indexOf(u8, exec_result.stderr, stderr.bytes) != null),
+                }
+            }
         }
     }
 
@@ -357,7 +394,7 @@ pub const TestContext = struct {
         target: std.Target,
         cwd_dir: fs.Dir,
         cwd: []const u8,
-    ) !void {
+    ) !bool {
         var zig_args = std.ArrayList([]const u8).init(arena);
         try zig_args.append(testing.zig_exe_path);
 
@@ -408,6 +445,13 @@ pub const TestContext = struct {
             .cwd_dir = cwd_dir,
             .cwd = cwd,
         });
+        if (artifact.expected_error) |err| {
+            switch (err.tag) {
+                .exact => try testing.expectEqualStrings(err.bytes, result.stderr),
+                .fuzzy => try testing.expect(mem.indexOf(u8, result.stderr, err.bytes) != null),
+            }
+            return false;
+        }
         if (result.stdout.len != 0) {
             print("unexpected stdout: {s}", .{result.stdout});
         }
@@ -419,6 +463,7 @@ pub const TestContext = struct {
             dumpArgs(zig_args.items);
             return error.CompileError;
         }
+        return true;
     }
 
     fn inspectArtifact(arena: Allocator, artifact: Artifact, cwd_dir: fs.Dir, target: std.Target) !void {

@@ -34,6 +34,22 @@ pub fn addCases(ctx: *TestContext) !void {
         }
 
         {
+            const case = try ctx.createCase("bss", target);
+            const exe = try case.createExe("main");
+            try exe.addCSource("main.c",
+                \\#include <stdio.h>
+                \\
+                \\static int foo[100];
+                \\
+                \\int main() {
+                \\  foo[1] = 5;
+                \\  printf("%d %d", foo[0], foo[1], foo);
+                \\}
+            , &.{});
+            case.expectStdOut("0 5");
+        }
+
+        {
             const case = try ctx.createCase("dylib", target);
             const dylib = try case.createShared("a");
             try dylib.addCSource("a.c",
@@ -186,6 +202,20 @@ pub fn addCases(ctx: *TestContext) !void {
                 \\}
             , &.{});
             case.expectStdOut("0 0");
+        }
+
+        {
+            const case = try ctx.createCase("duplicate symbol error", target);
+            const exe = try case.createExe("main");
+            exe.addZigSource("main.zig",
+                \\export fn hello() void {}
+                \\
+                \\pub fn main() void {}
+            );
+            try exe.addCSource("a.c",
+                \\void hello() {}
+            , &.{});
+            exe.expectErrorFuzzy("symbol '_hello' defined multiple times");
         }
     }
 }
