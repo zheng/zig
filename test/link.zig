@@ -217,5 +217,66 @@ pub fn addCases(ctx: *TestContext) !void {
             , &.{});
             exe.expectErrorFuzzy("symbol '_hello' defined multiple times");
         }
+
+        {
+            const case = try ctx.createCase("link system lib", target);
+            const dylib = try case.createShared("foo");
+            try dylib.addCSource("foo.c",
+                \\#include <stdio.h>
+                \\
+                \\void hello() {
+                \\  printf("Hello world\n");
+                \\}
+            , &.{});
+            const exe = try case.createExe("main");
+            try exe.addCSource("main.c",
+                \\extern void hello();
+                \\
+                \\int main() {
+                \\  hello();
+                \\}
+            , &.{});
+            try exe.addLinkFlags(&.{ "-L.", "-lfoo", "-rpath", "." });
+            case.expectStdOut("Hello world\n");
+        }
+
+        {
+            const case = try ctx.createCase("c++", target);
+            const exe = try case.createExe("main");
+            try exe.addCSource("main.cpp",
+                \\#include <iostream>
+                \\
+                \\int main() {
+                \\  std::cout << "Hello, world!" << std::endl;
+                \\}
+            , &.{});
+            try exe.addLinkFlags(&.{"-lc++"});
+            case.expectStdOut("Hello, world!\n");
+        }
+
+        {
+            const case = try ctx.createCase("objc", target);
+            const exe = try case.createExe("main");
+            try exe.addCSource("a.m",
+                \\#import <Foundation/NSObject.h>
+                \\@interface MyClass: NSObject
+                \\@end
+                \\@implementation MyClass
+                \\@end
+            , &.{
+                "-iframeworkwithsysroot",
+                "/System/Library/Frameworks",
+            });
+            try exe.addCSource("main.c",
+                \\int main() {}
+            , &.{});
+            try exe.addLinkFlags(&.{
+                "-F",
+                "/System/Library/Frameworks",
+                "-framework",
+                "Foundation",
+            });
+            exe.requires_macos_sdk = true;
+        }
     }
 }

@@ -63,6 +63,7 @@ pub const TestContext = struct {
         link_objects: std.ArrayList(*const Artifact),
         link_flags: std.ArrayList([]const u8),
         expected_error: ?ExpectedOut = null,
+        requires_macos_sdk: bool = false,
 
         const Tag = enum {
             exe,
@@ -258,7 +259,7 @@ pub const TestContext = struct {
         const arena = arena_allocator.allocator();
 
         var tmp = tmpDir(.{});
-        defer tmp.cleanup();
+        // defer tmp.cleanup();
 
         var cache_dir = try tmp.dir.makeOpenPath("zig-cache", .{});
         defer cache_dir.close();
@@ -405,6 +406,13 @@ pub const TestContext = struct {
                 try zig_args.append("-dynamic");
             },
             .archive => try zig_args.append("build-lib"),
+        }
+
+        if (artifact.requires_macos_sdk) {
+            if (!std.zig.system.darwin.isDarwinSDKInstalled(arena)) return false;
+            const sdk = std.zig.system.darwin.getDarwinSDK(arena, target) orelse return false;
+            try zig_args.append("--sysroot");
+            try zig_args.append(sdk.path);
         }
 
         if (artifact.zig_source) |zig_source| {
