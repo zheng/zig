@@ -316,6 +316,7 @@ pub const Inst = struct {
 
 pub const ImmPair = struct {
     dest_off: i32,
+    dest_ptr_size: u32,
     operand: i32,
 };
 

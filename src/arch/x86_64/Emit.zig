@@ -206,7 +206,7 @@ fn mirPushPop(emit: *Emit, tag: Tag, inst: Mir.Inst.Index) InnerError!void {
         0b01 => {
             // PUSH/POP r/m64
             const imm = emit.mir.instructions.items(.data)[inst].imm;
-            return lowerToMEnc(tag, RegisterOrMemory.mem(ops.reg1, imm), emit.code);
+            return lowerToMEnc(tag, RegisterOrMemory.mem(ops.reg1, imm, 8), emit.code);
         },
         0b10 => {
             // PUSH imm32
@@ -254,7 +254,7 @@ fn mirJmpCall(emit: *Emit, tag: Tag, inst: Mir.Inst.Index) InnerError!void {
     if (ops.reg1 == .none) {
         // JMP/CALL [imm]
         const imm = emit.mir.instructions.items(.data)[inst].imm;
-        return lowerToMEnc(tag, RegisterOrMemory.mem(null, imm), emit.code);
+        return lowerToMEnc(tag, RegisterOrMemory.mem(null, imm, 8), emit.code);
     }
     // JMP/CALL reg
     return lowerToMEnc(tag, RegisterOrMemory.reg(ops.reg1), emit.code);
@@ -722,6 +722,7 @@ const Memory = struct {
     reg: ?Register,
     rip: bool = false,
     disp: i32,
+    ptr_size: u32,
     sib: ?ScaleIndexBase = null,
 };
 
@@ -733,11 +734,12 @@ const RegisterOrMemory = union(enum) {
         return .{ .register = register };
     }
 
-    fn mem(register: ?Register, disp: i32) RegisterOrMemory {
+    fn mem(register: ?Register, disp: i32, ptr_size: u32) RegisterOrMemory {
         return .{
             .memory = .{
                 .reg = register,
                 .disp = disp,
+                .ptr_size = ptr_size,
             },
         };
     }
@@ -748,6 +750,7 @@ const RegisterOrMemory = union(enum) {
                 .reg = null,
                 .rip = true,
                 .disp = disp,
+                .ptr_size = 8,
             },
         };
     }
@@ -977,8 +980,11 @@ fn lowerToMiEnc(tag: Tag, reg_or_mem: RegisterOrMemory, imm: i32, code: *std.Arr
             }
         },
         .memory => |dst_mem| {
-            const opc = getOpCode(tag, .mi, false).?;
+            const opc = getOpCode(tag, .mi, dst_mem.ptr_size == 1).?;
             const encoder = try Encoder.init(code, 12);
+            if (dst_mem.ptr_size == 2) {
+                encoder.opcode_1byte(0x66);
+            }
             if (dst_mem.reg) |dst_reg| {
                 // Register dst_reg can either be 64bit or 32bit in size.
                 // TODO for memory operand, immediate operand pair, we currently
@@ -988,7 +994,7 @@ fn lowerToMiEnc(tag: Tag, reg_or_mem: RegisterOrMemory, imm: i32, code: *std.Arr
                 // TODO we currently don't have a way to flag imm32 64bit sign extended
                 if (dst_reg.size() != 64) return error.EmitFail;
                 encoder.rex(.{
-                    .w = false,
+                    .w = dst_mem.ptr_size == 8,
                     .b = dst_reg.isExtended(),
                 });
                 opc.encode(encoder);
@@ -1026,7 +1032,18 @@ fn lowerToMiEnc(tag: Tag, reg_or_mem: RegisterOrMemory, imm: i32, code: *std.Arr
                 }
                 encoder.disp32(dst_mem.disp);
             }
-            encoder.imm32(imm);
+            switch (dst_mem.ptr_size) {
+                1 => {
+                    const imm8 = try math.cast(i8, imm);
+                    encoder.imm8(imm8);
+                },
+                2 => {
+                    const imm16 = try math.cast(i16, imm);
+                    encoder.imm16(imm16);
+                },
+                4, 8 => encoder.imm32(imm),
+                else => unreachable,
+            }
         },
     }
 }
@@ -1194,11 +1211,15 @@ fn lowerToRmiEnc(
     imm: i32,
     code: *std.ArrayList(u8),
 ) InnerError!void {
+    if (reg.size() == 8) return error.EmitFail;
     const opc = getOpCode(tag, .rmi, reg.size() == 8).?;
+    const encoder = try Encoder.init(code, 13);
+    if (reg.size() == 16) {
+        encoder.opcode_1byte(0x66);
+    }
     switch (reg_or_mem) {
         .register => |src_reg| {
             if (reg.size() != src_reg.size()) return error.EmitFail;
-            const encoder = try Encoder.init(code, 7);
             encoder.rex(.{
                 .w = reg.size() == 64,
                 .r = reg.isExtended(),
@@ -1206,28 +1227,13 @@ fn lowerToRmiEnc(
             });
             opc.encode(encoder);
             encoder.modRm_direct(reg.lowId(), src_reg.lowId());
-            switch (reg.size()) {
-                8 => {
-                    const imm8 = try math.cast(i8, imm);
-                    encoder.imm8(imm8);
-                },
-                16 => {
-                    const imm16 = try math.cast(i16, imm);
-                    encoder.imm16(imm16);
-                },
-                32, 64 => encoder.imm32(imm),
-                else => unreachable,
-            }
         },
         .memory => |src_mem| {
-            const encoder = try Encoder.init(code, 13);
-            if (reg.size() == 16) {
-                encoder.opcode_1byte(0x66);
-            }
             if (src_mem.reg) |src_reg| {
                 // TODO handle 32-bit base register - requires prefix 0x67
                 // Intel Manual, Vol 1, chapter 3.6 and 3.6.1
                 if (src_reg.size() != 64) return error.EmitFail;
+                if (src_mem.ptr_size == 1) return error.EmitFail;
                 encoder.rex(.{
                     .w = reg.size() == 64,
                     .r = reg.isExtended(),
@@ -1272,8 +1278,17 @@ fn lowerToRmiEnc(
                 }
                 encoder.disp32(src_mem.disp);
             }
-            encoder.imm32(imm);
         },
+    }
+    switch (reg.size()) {
+        // TODO 8bit immediate
+        8 => unreachable,
+        16 => {
+            const imm16 = try math.cast(i16, imm);
+            encoder.imm16(imm16);
+        },
+        32, 64 => encoder.imm32(imm),
+        else => unreachable,
     }
 }
 
@@ -1293,36 +1308,38 @@ fn mirArith(emit: *Emit, tag: Tag, inst: Mir.Inst.Index) InnerError!void {
         },
         0b01 => {
             const imm = emit.mir.instructions.items(.data)[inst].imm;
+            const ptr_size = @divExact(ops.reg1.size(), 8);
             if (ops.reg2 == .none) {
-                // mov reg1, [imm32]
+                // mov reg1, ptr [imm32]
                 // RM
-                return lowerToRmEnc(tag, ops.reg1, RegisterOrMemory.mem(null, imm), emit.code);
+                return lowerToRmEnc(tag, ops.reg1, RegisterOrMemory.mem(null, imm, ptr_size), emit.code);
             }
-            // mov reg1, [reg2 + imm32]
+            // mov reg1, ptr [reg2 + imm32]
             // RM
-            return lowerToRmEnc(tag, ops.reg1, RegisterOrMemory.mem(ops.reg2, imm), emit.code);
+            return lowerToRmEnc(tag, ops.reg1, RegisterOrMemory.mem(ops.reg2, imm, ptr_size), emit.code);
         },
         0b10 => {
             if (ops.reg2 == .none) {
                 // mov dword ptr [reg1 + 0], imm32
                 // MI
                 const imm = emit.mir.instructions.items(.data)[inst].imm;
-                return lowerToMiEnc(tag, RegisterOrMemory.mem(ops.reg1, 0), imm, emit.code);
+                return lowerToMiEnc(tag, RegisterOrMemory.mem(ops.reg1, 0, 4), imm, emit.code);
             }
-            // mov [reg1 + imm32], reg2
+            // mov ptr [reg1 + imm32], reg2
             // MR
             const imm = emit.mir.instructions.items(.data)[inst].imm;
-            return lowerToMrEnc(tag, RegisterOrMemory.mem(ops.reg1, imm), ops.reg2, emit.code);
+            const ptr_size = @divExact(ops.reg2.size(), 8);
+            return lowerToMrEnc(tag, RegisterOrMemory.mem(ops.reg1, imm, ptr_size), ops.reg2, emit.code);
         },
         0b11 => {
             if (ops.reg2 == .none) {
-                // mov dword ptr [reg1 + imm32], imm32
+                // mov ptr [reg1 + imm32], imm32
                 // MI
                 const payload = emit.mir.instructions.items(.data)[inst].payload;
                 const imm_pair = emit.mir.extraData(Mir.ImmPair, payload).data;
                 return lowerToMiEnc(
                     tag,
-                    RegisterOrMemory.mem(ops.reg1, imm_pair.dest_off),
+                    RegisterOrMemory.mem(ops.reg1, imm_pair.dest_off, imm_pair.dest_ptr_size),
                     imm_pair.operand,
                     emit.code,
                 );
@@ -1492,7 +1509,8 @@ fn mirLea(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
     const ops = Mir.Ops.decode(emit.mir.instructions.items(.ops)[inst]);
     assert(ops.flags == 0b01);
     const imm = emit.mir.instructions.items(.data)[inst].imm;
-    return lowerToRmEnc(.lea, ops.reg1, RegisterOrMemory.mem(ops.reg2, imm), emit.code);
+    const ptr_size = @divExact(ops.reg1.size(), 8);
+    return lowerToRmEnc(.lea, ops.reg1, RegisterOrMemory.mem(ops.reg2, imm, ptr_size), emit.code);
 }
 
 fn mirLeaRip(emit: *Emit, inst: Mir.Inst.Index) InnerError!void {
@@ -1757,23 +1775,23 @@ test "lower MI encoding" {
     defer code.deinit();
     try lowerToMiEnc(.mov, RegisterOrMemory.reg(.rax), 0x10, code.buffer());
     try expectEqualHexStrings("\x48\xc7\xc0\x10\x00\x00\x00", code.emitted(), "mov rax, 0x10");
-    try lowerToMiEnc(.mov, RegisterOrMemory.mem(.r11, 0), 0x10, code.buffer());
+    try lowerToMiEnc(.mov, RegisterOrMemory.mem(.r11, 0, 4), 0x10, code.buffer());
     try expectEqualHexStrings("\x41\xc7\x03\x10\x00\x00\x00", code.emitted(), "mov dword ptr [r11 + 0], 0x10");
-    try lowerToMiEnc(.add, RegisterOrMemory.mem(.rdx, -8), 0x10, code.buffer());
+    try lowerToMiEnc(.add, RegisterOrMemory.mem(.rdx, -8, 4), 0x10, code.buffer());
     try expectEqualHexStrings("\x81\x42\xF8\x10\x00\x00\x00", code.emitted(), "add dword ptr [rdx - 8], 0x10");
-    try lowerToMiEnc(.sub, RegisterOrMemory.mem(.r11, 0x10000000), 0x10, code.buffer());
+    try lowerToMiEnc(.sub, RegisterOrMemory.mem(.r11, 0x10000000, 4), 0x10, code.buffer());
     try expectEqualHexStrings(
         "\x41\x81\xab\x00\x00\x00\x10\x10\x00\x00\x00",
         code.emitted(),
         "sub dword ptr [r11 + 0x10000000], 0x10",
     );
-    try lowerToMiEnc(.@"and", RegisterOrMemory.mem(null, 0x10000000), 0x10, code.buffer());
+    try lowerToMiEnc(.@"and", RegisterOrMemory.mem(null, 0x10000000, 4), 0x10, code.buffer());
     try expectEqualHexStrings(
         "\x81\x24\x25\x00\x00\x00\x10\x10\x00\x00\x00",
         code.emitted(),
         "and dword ptr [ds:0x10000000], 0x10",
     );
-    try lowerToMiEnc(.@"and", RegisterOrMemory.mem(.r12, 0x10000000), 0x10, code.buffer());
+    try lowerToMiEnc(.@"and", RegisterOrMemory.mem(.r12, 0x10000000, 4), 0x10, code.buffer());
     try expectEqualHexStrings(
         "\x41\x81\xA4\x24\x00\x00\x00\x10\x10\x00\x00\x00",
         code.emitted(),
@@ -1783,8 +1801,18 @@ test "lower MI encoding" {
     try expectEqualHexStrings(
         "\xC7\x05\x10\x00\x00\x00\x10\x00\x00\x00",
         code.emitted(),
-        "mov [rip + 0x10], 0x10",
+        "mov qword ptr [rip + 0x10], 0x10",
     );
+    try lowerToMiEnc(.mov, RegisterOrMemory.mem(.rbp, -8, 8), 0x10, code.buffer());
+    try expectEqualHexStrings(
+        "\x48\xC7\x45\xF8\x10\x00\x00\x00",
+        code.emitted(),
+        "mov qword ptr [rbp - 8], 0x10",
+    );
+    try lowerToMiEnc(.mov, RegisterOrMemory.mem(.rbp, -2, 2), 0x10, code.buffer());
+    try expectEqualHexStrings("\x66\xC7\x45\xFE\x10\x00", code.emitted(), "mov word ptr [rbp - 2], 0x10");
+    try lowerToMiEnc(.mov, RegisterOrMemory.mem(.rbp, -1, 1), 0x10, code.buffer());
+    try expectEqualHexStrings("\xC6\x45\xFF\x10", code.emitted(), "mov byte ptr [rbp - 1], 0x10");
 }
 
 test "lower RM encoding" {
@@ -1792,33 +1820,33 @@ test "lower RM encoding" {
     defer code.deinit();
     try lowerToRmEnc(.mov, .rax, RegisterOrMemory.reg(.rbx), code.buffer());
     try expectEqualHexStrings("\x48\x8b\xc3", code.emitted(), "mov rax, rbx");
-    try lowerToRmEnc(.mov, .rax, RegisterOrMemory.mem(.r11, 0), code.buffer());
+    try lowerToRmEnc(.mov, .rax, RegisterOrMemory.mem(.r11, 0, 8), code.buffer());
     try expectEqualHexStrings("\x49\x8b\x03", code.emitted(), "mov rax, qword ptr [r11 + 0]");
-    try lowerToRmEnc(.add, .r11, RegisterOrMemory.mem(null, 0x10000000), code.buffer());
+    try lowerToRmEnc(.add, .r11, RegisterOrMemory.mem(null, 0x10000000, 8), code.buffer());
     try expectEqualHexStrings(
         "\x4C\x03\x1C\x25\x00\x00\x00\x10",
         code.emitted(),
         "add r11, qword ptr [ds:0x10000000]",
     );
-    try lowerToRmEnc(.add, .r12b, RegisterOrMemory.mem(null, 0x10000000), code.buffer());
+    try lowerToRmEnc(.add, .r12b, RegisterOrMemory.mem(null, 0x10000000, 1), code.buffer());
     try expectEqualHexStrings(
         "\x44\x02\x24\x25\x00\x00\x00\x10",
         code.emitted(),
         "add r11b, byte ptr [ds:0x10000000]",
     );
-    try lowerToRmEnc(.sub, .r11, RegisterOrMemory.mem(.r13, 0x10000000), code.buffer());
+    try lowerToRmEnc(.sub, .r11, RegisterOrMemory.mem(.r13, 0x10000000, 8), code.buffer());
     try expectEqualHexStrings(
         "\x4D\x2B\x9D\x00\x00\x00\x10",
         code.emitted(),
         "sub r11, qword ptr [r13 + 0x10000000]",
     );
-    try lowerToRmEnc(.sub, .r11, RegisterOrMemory.mem(.r12, 0x10000000), code.buffer());
+    try lowerToRmEnc(.sub, .r11, RegisterOrMemory.mem(.r12, 0x10000000, 8), code.buffer());
     try expectEqualHexStrings(
         "\x4D\x2B\x9C\x24\x00\x00\x00\x10",
         code.emitted(),
         "sub r11, qword ptr [r12 + 0x10000000]",
     );
-    try lowerToRmEnc(.mov, .rax, RegisterOrMemory.mem(.rbp, -4), code.buffer());
+    try lowerToRmEnc(.mov, .rax, RegisterOrMemory.mem(.rbp, -4, 8), code.buffer());
     try expectEqualHexStrings("\x48\x8B\x45\xFC", code.emitted(), "mov rax, qword ptr [rbp - 4]");
     try lowerToRmEnc(.lea, .rax, RegisterOrMemory.rip(0x10), code.buffer());
     try expectEqualHexStrings("\x48\x8D\x05\x10\x00\x00\x00", code.emitted(), "lea rax, [rip + 0x10]");
@@ -1829,21 +1857,21 @@ test "lower MR encoding" {
     defer code.deinit();
     try lowerToMrEnc(.mov, RegisterOrMemory.reg(.rax), .rbx, code.buffer());
     try expectEqualHexStrings("\x48\x89\xd8", code.emitted(), "mov rax, rbx");
-    try lowerToMrEnc(.mov, RegisterOrMemory.mem(.rbp, -4), .r11, code.buffer());
+    try lowerToMrEnc(.mov, RegisterOrMemory.mem(.rbp, -4, 8), .r11, code.buffer());
     try expectEqualHexStrings("\x4c\x89\x5d\xfc", code.emitted(), "mov qword ptr [rbp - 4], r11");
-    try lowerToMrEnc(.add, RegisterOrMemory.mem(null, 0x10000000), .r12b, code.buffer());
+    try lowerToMrEnc(.add, RegisterOrMemory.mem(null, 0x10000000, 1), .r12b, code.buffer());
     try expectEqualHexStrings(
         "\x44\x00\x24\x25\x00\x00\x00\x10",
         code.emitted(),
         "add byte ptr [ds:0x10000000], r12b",
     );
-    try lowerToMrEnc(.add, RegisterOrMemory.mem(null, 0x10000000), .r12d, code.buffer());
+    try lowerToMrEnc(.add, RegisterOrMemory.mem(null, 0x10000000, 4), .r12d, code.buffer());
     try expectEqualHexStrings(
         "\x44\x01\x24\x25\x00\x00\x00\x10",
         code.emitted(),
         "add dword ptr [ds:0x10000000], r12d",
     );
-    try lowerToMrEnc(.sub, RegisterOrMemory.mem(.r11, 0x10000000), .r12, code.buffer());
+    try lowerToMrEnc(.sub, RegisterOrMemory.mem(.r11, 0x10000000, 8), .r12, code.buffer());
     try expectEqualHexStrings(
         "\x4D\x29\xA3\x00\x00\x00\x10",
         code.emitted(),
@@ -1898,11 +1926,11 @@ test "lower M encoding" {
     defer code.deinit();
     try lowerToMEnc(.jmp_near, RegisterOrMemory.reg(.r12), code.buffer());
     try expectEqualHexStrings("\x41\xFF\xE4", code.emitted(), "jmp r12");
-    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(.r12, 0), code.buffer());
+    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(.r12, 0, 8), code.buffer());
     try expectEqualHexStrings("\x41\xFF\x24\x24", code.emitted(), "jmp qword ptr [r12]");
-    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(.r12, 0x10), code.buffer());
+    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(.r12, 0x10, 8), code.buffer());
     try expectEqualHexStrings("\x41\xFF\x64\x24\x10", code.emitted(), "jmp qword ptr [r12 + 0x10]");
-    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(.r12, 0x1000), code.buffer());
+    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(.r12, 0x1000, 8), code.buffer());
     try expectEqualHexStrings(
         "\x41\xFF\xA4\x24\x00\x10\x00\x00",
         code.emitted(),
@@ -1910,7 +1938,7 @@ test "lower M encoding" {
     );
     try lowerToMEnc(.jmp_near, RegisterOrMemory.rip(0x10), code.buffer());
     try expectEqualHexStrings("\xFF\x25\x10\x00\x00\x00", code.emitted(), "jmp qword ptr [rip + 0x10]");
-    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(null, 0x10), code.buffer());
+    try lowerToMEnc(.jmp_near, RegisterOrMemory.mem(null, 0x10, 8), code.buffer());
     try expectEqualHexStrings("\xFF\x24\x25\x10\x00\x00\x00", code.emitted(), "jmp qword ptr [ds:0x10]");
     try lowerToMEnc(.seta, RegisterOrMemory.reg(.r11b), code.buffer());
     try expectEqualHexStrings("\x49\x0F\x97\xC3", code.emitted(), "seta r11b");
@@ -1928,8 +1956,18 @@ test "lower O encoding" {
 test "lower RMI encoding" {
     var code = TestEmitCode.init();
     defer code.deinit();
-    try lowerToRmiEnc(.imul, .rax, RegisterOrMemory.mem(.rbp, -8), 0x10, code.buffer());
-    try expectEqualHexStrings("\x48\x69\x45\xF8\x10\x00\x00\x00", code.emitted(), "imul rax, [rbp - 8], 0x10");
+    try lowerToRmiEnc(.imul, .rax, RegisterOrMemory.mem(.rbp, -8, 8), 0x10, code.buffer());
+    try expectEqualHexStrings(
+        "\x48\x69\x45\xF8\x10\x00\x00\x00",
+        code.emitted(),
+        "imul rax, qword ptr [rbp - 8], 0x10",
+    );
+    try lowerToRmiEnc(.imul, .eax, RegisterOrMemory.mem(.rbp, -4, 4), 0x10, code.buffer());
+    try expectEqualHexStrings("\x69\x45\xFC\x10\x00\x00\x00", code.emitted(), "imul ax, [rbp - 2], 0x10");
+    try lowerToRmiEnc(.imul, .ax, RegisterOrMemory.mem(.rbp, -2, 2), 0x10, code.buffer());
+    try expectEqualHexStrings("\x66\x69\x45\xFE\x10\x00", code.emitted(), "imul eax, [rbp - 4], 0x10");
     try lowerToRmiEnc(.imul, .r12, RegisterOrMemory.reg(.r12), 0x10, code.buffer());
     try expectEqualHexStrings("\x4D\x69\xE4\x10\x00\x00\x00", code.emitted(), "imul r12, r12, 0x10");
+    try lowerToRmiEnc(.imul, .r12w, RegisterOrMemory.reg(.r12w), 0x10, code.buffer());
+    try expectEqualHexStrings("\x66\x45\x69\xE4\x10\x00", code.emitted(), "imul r12w, r12w, 0x10");
 }

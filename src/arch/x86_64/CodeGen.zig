@@ -2791,18 +2791,13 @@ fn genSetStack(self: *Self, ty: Type, stack_offset: u32, mcv: MCValue) InnerErro
                 return self.fail("TODO implement set stack variable with large stack offset", .{});
             }
             switch (abi_size) {
-                1 => {
-                    return self.fail("TODO implement set abi_size=1 stack variable with immediate", .{});
-                },
-                2 => {
-                    return self.fail("TODO implement set abi_size=2 stack variable with immediate", .{});
-                },
-                4 => {
+                1, 2, 4 => {
                     // We have a positive stack offset value but we want a twos complement negative
                     // offset from rbp, which is at the top of the stack frame.
-                    // mov    DWORD PTR [rbp+offset], immediate
+                    // mov BYTE/WORD/DWORD PTR [rbp+offset], immediate
                     const payload = try self.addExtra(Mir.ImmPair{
                         .dest_off = -@intCast(i32, adj_off),
+                        .dest_ptr_size = @intCast(u32, abi_size),
                         .operand = @bitCast(i32, @intCast(u32, x_big)),
                     });
                     _ = try self.addInst(.{
@@ -2824,6 +2819,7 @@ fn genSetStack(self: *Self, ty: Type, stack_offset: u32, mcv: MCValue) InnerErro
                     {
                         const payload = try self.addExtra(Mir.ImmPair{
                             .dest_off = negative_offset + 4,
+                            .dest_ptr_size = 4,
                             .operand = @bitCast(i32, @truncate(u32, x_big >> 32)),
                         });
                         _ = try self.addInst(.{
@@ -2838,6 +2834,7 @@ fn genSetStack(self: *Self, ty: Type, stack_offset: u32, mcv: MCValue) InnerErro
                     {
                         const payload = try self.addExtra(Mir.ImmPair{
                             .dest_off = negative_offset,
+                            .dest_ptr_size = 4,
                             .operand = @bitCast(i32, @truncate(u32, x_big)),
                         });
                         _ = try self.addInst(.{
