@@ -47,6 +47,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
+#include <iostream>
 #include <memory>
 #include <set>
 #include <system_error>
@@ -488,9 +489,11 @@ int ZigClang_main(int Argc, const char **Argv) {
 
   ProcessWarningOptions(Diags, *DiagOpts, /*ReportDiags=*/false);
 
+  std::cout << "instantiating Driver with " << Path /*<< " " << llvm::sys::getDefaultTargetTriple << Diags*/ << std::endl;
   Driver TheDriver(Path, llvm::sys::getDefaultTargetTriple(), Diags);
   SetInstallDir(Args, TheDriver, CanonicalPrefixes);
   auto TargetAndMode = ToolChain::getTargetAndModeFromProgramName(Args[0]);
+  //std::cout << "TargetAndMode " << TargetAndMode << std::endl;
   TheDriver.setTargetAndMode(TargetAndMode);
 
   insertTargetAndModeArgs(TargetAndMode, Args, SavedStrings);
@@ -503,6 +506,15 @@ int ZigClang_main(int Argc, const char **Argv) {
     llvm::CrashRecoveryContext::Enable();
   }
 
+  // The command that gets run:
+  // clang -fno-caret-diagnostics -target arm-unknown-unknown-eabi -mcpu=cortex-m0plus+thumb2 -ffreestanding -c -o /Users/zheng/.cache/zig/tmp/acce739cdd19cbf8-test.o test.s
+  // Desired command:
+  // clang -cc1as -triple arm9 -target-feature thumb2 -o /Users/zheng/.cache/zig/tmp/acce739cdd19cbf8-test.o test.s
+  //Args[4] = "-mcpu=cortex-m0plus+thumb2";
+  std::cout << "Calling BuildCompilation with args:";
+  for (const char* str: Args) {
+	  std::cout << str << std::endl;
+  }
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
   int Res = 1;
   bool IsCrash = false;

@@ -3561,7 +3561,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: *std.P
     const tracy_trace = trace(@src());
     defer tracy_trace.end();
 
-    log.debug("updating C object: {s}", .{c_object.src.src_path});
+    log.err("updating C object: {s}", .{c_object.src.src_path});
 
     if (c_object.clearStatus(comp.gpa)) {
         // There was previous failure.
@@ -3660,6 +3660,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: *std.P
             dump_argv(argv.items);
         }
 
+        log.err("Calling child process {s}", .{argv.items});
         const child = try std.ChildProcess.init(argv.items, arena);
         defer child.deinit();
 
@@ -4027,6 +4028,7 @@ pub fn addCCArgs(
             // all CPU features here.
             switch (target.cpu.arch) {
                 .riscv32, .riscv64 => {
+                    log.err("In riscv32 riscv64 branch {s}", .{target.cpu.arch});
                     const RvArchFeat = struct { char: u8, feat: std.Target.riscv.Feature };
                     const letters = [_]RvArchFeat{
                         .{ .char = 'm', .feat = .m },
@@ -4071,6 +4073,9 @@ pub fn addCCArgs(
                     } else {
                         try argv.append("-mno-save-restore");
                     }
+                },
+                .arm, .armeb => {
+                    log.err("In arm branch the arch is {s}", .{target.cpu.arch});
                 },
                 else => {
                     // TODO
