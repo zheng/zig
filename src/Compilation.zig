@@ -3644,6 +3644,7 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: *std.P
         //    .yes => argv.appendSliceAssumeCapacity(&[_][]const u8{ "-E", "-o", out_obj_path }),
         //    .stdout => argv.appendAssumeCapacity("-E"),
         //}
+        argv.appendSliceAssumeCapacity(&[_][]const u8{ "-o", out_obj_path });
         if (comp.clang_passthrough_mode) {
             if (comp.emit_asm != null) {
                 argv.appendAssumeCapacity("-S");
