@@ -3639,11 +3639,11 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_obj_prog_node: *std.P
         try comp.addCCArgs(arena, &argv, ext, out_dep_path);
 
         try argv.ensureUnusedCapacity(6 + c_object.src.extra_flags.len);
-        switch (comp.clang_preprocessor_mode) {
-            .no => argv.appendSliceAssumeCapacity(&[_][]const u8{ "-c", "-o", out_obj_path }),
-            .yes => argv.appendSliceAssumeCapacity(&[_][]const u8{ "-E", "-o", out_obj_path }),
-            .stdout => argv.appendAssumeCapacity("-E"),
-        }
+        //switch (comp.clang_preprocessor_mode) {
+        //    .no => argv.appendSliceAssumeCapacity(&[_][]const u8{ "-c", "-o", out_obj_path }),
+        //    .yes => argv.appendSliceAssumeCapacity(&[_][]const u8{ "-E", "-o", out_obj_path }),
+        //    .stdout => argv.appendAssumeCapacity("-E"),
+        //}
         if (comp.clang_passthrough_mode) {
             if (comp.emit_asm != null) {
                 argv.appendAssumeCapacity("-S");
@@ -3798,7 +3798,7 @@ pub fn addCCArgs(
     // clang will detect stderr as a pipe rather than a terminal.
     if (!comp.clang_passthrough_mode) {
         // Make stderr more easily parseable.
-        try argv.append("-fno-caret-diagnostics");
+        // try argv.append("-fno-caret-diagnostics");
     }
 
     if (comp.bin_file.options.function_sections) {
@@ -3844,8 +3844,9 @@ pub fn addCCArgs(
         try argv.append(glibc_minor_define);
     }
 
-    const llvm_triple = try @import("codegen/llvm.zig").targetTriple(arena, target);
-    try argv.appendSlice(&[_][]const u8{ "-target", llvm_triple });
+    //We need a different format for the target for the clang frontend
+    //const llvm_triple = try @import("codegen/llvm.zig").targetTriple(arena, target);
+    //try argv.appendSlice(&[_][]const u8{ "-target", llvm_triple });
 
     switch (ext) {
         .c, .cpp, .m, .mm, .h => {
@@ -4075,7 +4076,11 @@ pub fn addCCArgs(
                     }
                 },
                 .arm, .armeb => {
-                    log.err("In arm branch the arch is {s}", .{target.cpu.arch});
+                    try argv.append("-cc1as");
+                    try argv.append("-triple");
+                    try argv.append("-arm9");
+
+                    // Loop through all the -target-features
                 },
                 else => {
                     // TODO
@@ -4105,9 +4110,9 @@ pub fn addCCArgs(
         try argv.append("-integrated-as");
     }
 
-    if (target.os.tag == .freestanding) {
-        try argv.append("-ffreestanding");
-    }
+    //if (target.os.tag == .freestanding) {
+    //    try argv.append("-ffreestanding");
+    //}
 
     try argv.appendSlice(comp.clang_argv);
 }

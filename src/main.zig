@@ -1951,7 +1951,8 @@ fn buildOutputType(
             }
 
             const adjusted_target_mcpu = try arena.dupe(u8, mcpu_buffer.items);
-            std.log.debug("adjusted target_mcpu: {s}", .{adjusted_target_mcpu});
+            std.log.err("adjusted target_mcpu: {s}", .{adjusted_target_mcpu});
+            // Seems to be relevant.
             target_parse_options.cpu_features = adjusted_target_mcpu;
         }
     }
